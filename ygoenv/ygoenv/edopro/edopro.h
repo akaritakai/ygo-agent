@@ -1636,6 +1636,11 @@ protected:
   // Value-initialized: Reset() and ~EDOProEnv() both delete non-null entries,
   // so indeterminate values here are a delete of garbage (crashes whenever the
   // object lands on recycled heap rather than fresh zeroed pages).
+  // Involuntary-loop detection (see MSG_CHAINING handler)
+  uint64_t chains_since_decision_ = 0;
+  CardCode loop_cause_code_ = 0;
+  static constexpr uint64_t kInvoluntaryLoopChains = 2000;
+
   Player *players_[2]{}; //  abstract class must be pointer
 
   std::uniform_int_distribution<uint64_t> dist_int_;
@@ -1754,6 +1759,8 @@ public:
     // indices; parsing leftovers as the new duel's stream desyncs everything.
     dp_ = 0;
     fdl_ = 0;
+    chains_since_decision_ = 0;
+    loop_cause_code_ = 0;
     if (random_mode()) {
       play_mode_ = play_modes_[dist_int_(gen_) % play_modes_.size()];
     } else {
@@ -2737,8 +2744,24 @@ private:
           dp_ = dl_;
         }
         if (options_.empty()) {
+          if (chains_since_decision_ > kInvoluntaryLoopChains) {
+            if (std::getenv("YGOENV_CORE_LOG")) {
+              fmt::print(stderr,
+                         "[env] involuntary loop: {} chains since last "
+                         "decision, primary cause code {}\n",
+                         chains_since_decision_, loop_cause_code_);
+            }
+            chains_since_decision_ = 0;
+          }
           continue;
         }
+        // A decision means the player can stop: by policy this is a
+        // controlled loop, not an infinite one.
+        if (chains_since_decision_ >= 50 && std::getenv("YGOENV_LOOP_STATS")) {
+          fmt::print(stderr, "[loopstats] chains_before_decision={}\n",
+                     chains_since_decision_);
+        }
+        chains_since_decision_ = 0;
         if ((play_mode_ == kSelfPlay) || (to_play_ == ai_player_)) {
           if (options_.size() == 1) {
             prev_msg_for_retry_ = msg_;
@@ -3809,6 +3832,15 @@ private:
     } else if (msg_ == MSG_CHAIN_END) {
       dp_ = dl_;
     } else if (msg_ == MSG_CHAINING) {
+      // Loop detection (Tournament Policy v2.5 "Infinite Loop"): an
+      // involuntary loop is one the player cannot stop, i.e. it presents no
+      // decisions. Count chain activations since the last decision; the most
+      // recent activation is the policy's "primary cause" candidate.
+      {
+        CardCode chained = *reinterpret_cast<uint32_t *>(data_ + dp_);
+        ++chains_since_decision_;
+        loop_cause_code_ = chained;
+      }
       if (!verbose_) {
         dp_ = dl_;
         return;
