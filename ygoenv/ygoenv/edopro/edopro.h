@@ -1300,7 +1300,9 @@ inline const char *read_card_script(const std::string &path, int *lenptr) {
   auto full_path = "edopro_script/" + path;
   std::ifstream file(full_path, std::ios::binary);
   if (!file) {
-    fmt::print("Unable to open script file: {}\n", full_path);
+    if (std::getenv("YGOENV_CORE_LOG")) {
+      fmt::print(stderr, "Unable to open script file: {}\n", full_path);
+    }
     *lenptr = 0;
     return nullptr;
   }
@@ -1334,7 +1336,9 @@ inline int g_ScriptReader(void* payload, OCG_Duel duel, const char* name) {
 }
 
 void g_LogHandler(void* payload, const char* string, int type) {
-  fmt::println("[LOG] type: {}, string: {}", type, string);
+  if (std::getenv("YGOENV_CORE_LOG")) {
+    fmt::println(stderr, "[LOG] type: {}, string: {}", type, string);
+  }
 }
 
 static void init_module(const std::string &db_path,
@@ -2127,10 +2131,11 @@ private:
       auto it = spec2index.find(spec);
       if (it == spec2index.end()) {
         // TODO: find the root cause
-        // print spec2index
-        fmt::println("Spec2index:");
-        for (auto &[k, v] : spec2index) {
-          fmt::println("{}: {}", k, v);
+        if (std::getenv("YGOENV_QUERY_DEBUG")) {
+          fmt::println(stderr, "Spec not found: {}; spec2index:", spec);
+          for (auto &[k, v] : spec2index) {
+            fmt::println(stderr, "{}: {}", k, v);
+          }
         }
         // throw std::runtime_error("Spec not found: " + spec);
         idx = 1;
@@ -4086,14 +4091,6 @@ private:
           discard_hand_ = false;
           return;
         }
-
-        show_turn();
-
-        show_deck(player);
-        show_history_actions(player);
-
-        show_deck(1-player);
-        show_history_actions(1-player);
 
         // Fallback for selections larger than the action space supports:
         // pick min random cards (uniform legal choice), as with discards.
