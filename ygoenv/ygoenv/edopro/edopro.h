@@ -1952,9 +1952,24 @@ public:
 
     next();
 
+    // Loop guard: Yu-Gi-Oh! admits unbounded games (arXiv:2603.02863), and a
+    // wedged duel would silently occupy this env slot forever. Truncate as a
+    // draw once the decision budget is exhausted.
+    ++elapsed_step_;
+    if (!done_ && max_episode_steps_ > 0 &&
+        elapsed_step_ >= max_episode_steps_) {
+      done_ = true;
+      winner_ = 255;  // no winner: truncation draw
+      if (record_ && is_recording && fp_ != nullptr) {
+        fclose(fp_);
+        is_recording = false;
+      }
+    }
+
     float reward = 0;
     int reason = 0;
-    if (done_) {
+    // winner_ == 255 means truncation draw (loop guard): reward stays 0.
+    if (done_ && winner_ != 255) {
       float base_reward = 1.0;
       int win_turn = turn_count_ - winner_;
       if (win_turn <= 1) {
