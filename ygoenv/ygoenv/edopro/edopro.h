@@ -10,6 +10,7 @@
 #include <string>
 #include <cstring>
 #include <fstream>
+#include <stack>
 #include <shared_mutex>
 #include <iostream>
 
@@ -467,7 +468,7 @@ static std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, std::vector<uint
         break;
       }
       // Check if line contains only digits
-      if (std::all_of(line.begin(), line.end(), ::isdigit)) {
+      if (!line.empty() && std::all_of(line.begin(), line.end(), ::isdigit)) {
         main_deck.push_back(std::stoul(line));
       }
     }
@@ -479,7 +480,7 @@ static std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, std::vector<uint
           break;
         }
         // Check if line contains only digits
-        if (std::all_of(line.begin(), line.end(), ::isdigit)) {
+        if (!line.empty() && std::all_of(line.begin(), line.end(), ::isdigit)) {
           extra_deck.push_back(std::stoul(line));
         }
       }
@@ -488,7 +489,7 @@ static std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, std::vector<uint
     // Read the side deck
     while (std::getline(file, line)) {
       // Check if line contains only digits
-      if (std::all_of(line.begin(), line.end(), ::isdigit)) {
+      if (!line.empty() && std::all_of(line.begin(), line.end(), ::isdigit)) {
         side_deck.push_back(std::stoul(line));
       }
     }
@@ -693,6 +694,7 @@ static const std::vector<int> _msgs = {
     MSG_SELECT_YESNO,    MSG_SELECT_BATTLECMD, MSG_SELECT_UNSELECT_CARD,
     MSG_SELECT_OPTION,   MSG_SELECT_PLACE,     MSG_SELECT_SUM,
     MSG_SELECT_DISFIELD, MSG_ANNOUNCE_ATTRIB,  MSG_ANNOUNCE_NUMBER,
+    MSG_ANNOUNCE_CARD, MSG_ANNOUNCE_RACE,
 };
 
 static const ankerl::unordered_dense::map<int, uint8_t> msg2id =
@@ -1061,6 +1063,159 @@ inline const Card &c_get_card(CardCode code) { return cards_.at(code); }
 
 inline CardId &c_get_card_id(CardCode code) { return card_ids_.at(code); }
 
+#ifndef CARD_MARINE_DOLPHIN
+#define CARD_MARINE_DOLPHIN 78734254
+#define CARD_TWINKLE_MOSS 13857930
+#endif
+
+// Mirrors is_declarable in ygopro-core/playerop.cpp (MSG_ANNOUNCE_CARD
+// opcode filter). Keep in sync with the core.
+// Mirrors ygopro-core's MSG_SELECT_SUM acceptance rules
+// (field::process(Processors::SelectSum&) step 1).
+// exact mode (mode==0): some o1/o2 assignment of the chosen cards sums to acc.
+// overflow mode (mode==1): max-sum >= acc and (min-sum - smallest) < acc.
+inline bool sum_exact_check(const std::vector<int> &o1,
+                            const std::vector<int> &o2,
+                            const std::vector<int> &cur, size_t k,
+                            int64_t remaining) {
+  if (k == cur.size()) {
+    return remaining == 0;
+  }
+  int i = cur[k];
+  if (remaining >= o1[i] &&
+      sum_exact_check(o1, o2, cur, k + 1, remaining - o1[i])) {
+    return true;
+  }
+  if (o2[i] != 0 && remaining >= o2[i] &&
+      sum_exact_check(o1, o2, cur, k + 1, remaining - o2[i])) {
+    return true;
+  }
+  return false;
+}
+
+inline void sum_combos_dfs(const std::vector<int> &o1,
+                           const std::vector<int> &o2, int64_t acc, bool exact,
+                           int min_cnt, int max_cnt, size_t idx,
+                           std::vector<int> &cur,
+                           std::vector<std::vector<int>> &out, size_t cap) {
+  if (out.size() >= cap) {
+    return;
+  }
+  if (!cur.empty() && (int)cur.size() >= min_cnt && (int)cur.size() <= max_cnt) {
+    if (exact) {
+      if (sum_exact_check(o1, o2, cur, 0, acc)) {
+        out.push_back(cur);
+      }
+    } else {
+      int64_t summin = 0, summax = 0, mn = INT64_MAX;
+      for (int i : cur) {
+        int a = o1[i], b = o2[i];
+        int64_t ms = (b != 0 && b < a) ? b : a;
+        int64_t mx = (b > a) ? b : a;
+        summin += ms;
+        summax += mx;
+        mn = std::min(mn, ms);
+      }
+      if (summax >= acc && summin - mn < acc) {
+        out.push_back(cur);
+      }
+    }
+  }
+  if (idx >= o1.size() || cur.size() >= 8) {
+    return;
+  }
+  cur.push_back((int)idx);
+  sum_combos_dfs(o1, o2, acc, exact, min_cnt, max_cnt, idx + 1, cur, out, cap);
+  cur.pop_back();
+  sum_combos_dfs(o1, o2, acc, exact, min_cnt, max_cnt, idx + 1, cur, out, cap);
+}
+
+inline bool is_declarable(const OCG_CardData &cd,
+                          const std::vector<uint64_t> &opcodes) {
+  std::stack<int64_t> stack;
+  bool alias = false, token = false;
+  auto binary = [&stack](auto fn) {
+    if (stack.size() >= 2) {
+      int64_t rhs = stack.top();
+      stack.pop();
+      int64_t lhs = stack.top();
+      stack.pop();
+      stack.push(fn(lhs, rhs));
+    }
+  };
+  auto unary = [&stack](auto fn) {
+    if (!stack.empty()) {
+      int64_t v = stack.top();
+      stack.pop();
+      stack.push(fn(v));
+    }
+  };
+  for (const auto &opcode : opcodes) {
+    switch (opcode) {
+    case OPCODE_ADD: binary([](int64_t a, int64_t b) { return a + b; }); break;
+    case OPCODE_SUB: binary([](int64_t a, int64_t b) { return a - b; }); break;
+    case OPCODE_MUL: binary([](int64_t a, int64_t b) { return a * b; }); break;
+    case OPCODE_DIV: binary([](int64_t a, int64_t b) { return b ? a / b : 0; }); break;
+    case OPCODE_AND: binary([](int64_t a, int64_t b) -> int64_t { return a && b; }); break;
+    case OPCODE_OR: binary([](int64_t a, int64_t b) -> int64_t { return a || b; }); break;
+    case OPCODE_NEG: unary([](int64_t v) { return -v; }); break;
+    case OPCODE_NOT: unary([](int64_t v) -> int64_t { return !v; }); break;
+    case OPCODE_BAND: binary([](int64_t a, int64_t b) { return a & b; }); break;
+    case OPCODE_BOR: binary([](int64_t a, int64_t b) { return a | b; }); break;
+    case OPCODE_BXOR: binary([](int64_t a, int64_t b) { return a ^ b; }); break;
+    case OPCODE_BNOT: unary([](int64_t v) { return ~v; }); break;
+    case OPCODE_LSHIFT: binary([](int64_t a, int64_t b) { return a << b; }); break;
+    case OPCODE_RSHIFT: binary([](int64_t a, int64_t b) { return a >> b; }); break;
+    case OPCODE_ISCODE:
+      unary([&cd](int64_t v) -> int64_t { return cd.code == (uint32_t)v; });
+      break;
+    case OPCODE_ISTYPE:
+      unary([&cd](int64_t v) -> int64_t { return cd.type & v; });
+      break;
+    case OPCODE_ISRACE:
+      unary([&cd](int64_t v) -> int64_t { return (cd.race & v) != 0; });
+      break;
+    case OPCODE_ISATTRIBUTE:
+      unary([&cd](int64_t v) -> int64_t { return cd.attribute & v; });
+      break;
+    case OPCODE_GETCODE: stack.push(cd.code); break;
+    case OPCODE_GETTYPE: stack.push(cd.type); break;
+    case OPCODE_GETRACE: stack.push(static_cast<int64_t>(cd.race)); break;
+    case OPCODE_GETATTRIBUTE: stack.push(cd.attribute); break;
+    case OPCODE_ISSETCARD: {
+      if (!stack.empty()) {
+        int32_t set_code = (int32_t)stack.top();
+        stack.pop();
+        bool res = false;
+        uint16_t settype = set_code & 0xfff;
+        uint16_t setsubtype = set_code & 0xf000;
+        if (cd.setcodes != nullptr) {
+          for (const uint16_t *sc = cd.setcodes; *sc != 0; ++sc) {
+            if ((*sc & 0xfff) == settype &&
+                (*sc & 0xf000 & setsubtype) == setsubtype) {
+              res = true;
+              break;
+            }
+          }
+        }
+        stack.push(res);
+      }
+      break;
+    }
+    case OPCODE_ALLOW_ALIASES: alias = true; break;
+    case OPCODE_ALLOW_TOKENS: token = true; break;
+    default: stack.push(static_cast<int64_t>(opcode)); break;
+    }
+  }
+  if (stack.size() != 1 || stack.top() == 0) {
+    return false;
+  }
+  return cd.code == CARD_MARINE_DOLPHIN || cd.code == CARD_TWINKLE_MOSS ||
+         ((alias || !cd.alias) &&
+          (token || ((cd.type & (TYPE_MONSTER + TYPE_TOKEN)) !=
+                     (TYPE_MONSTER + TYPE_TOKEN))));
+}
+
 inline void sort_extra_deck(std::vector<CardCode> &deck) {
   std::vector<CardCode> c;
   std::vector<std::pair<CardCode, int>> fusion, xyz, synchro, link;
@@ -1196,6 +1351,17 @@ static void init_module(const std::string &db_path,
   }
 
   SQLite::Database db(db_path, SQLite::OPEN_READONLY);
+
+  // Preload every card in the code list (not just deck cards): effects can
+  // put tokens and non-deck cards into play, and a cards_ miss is fatal.
+  {
+    std::vector<CardCode> all_codes;
+    all_codes.reserve(card_ids_.size());
+    for (const auto &[code, idx] : card_ids_) {
+      all_codes.push_back(code);
+    }
+    preload_deck(db, all_codes, true);
+  }
 
   for (const auto &[name, deck] : decks) {
     auto [main_deck, extra_deck, side_deck] = read_decks(deck);
@@ -1369,15 +1535,15 @@ public:
             Spec<uint8_t>({conf["max_options"_], n_action_feats})),
         "obs:h_actions_"_.Bind(
             Spec<uint8_t>({conf["n_history_actions"_], n_action_feats})),
-        "info:num_options"_.Bind(Spec<int>({}, {0, conf["max_options"_] - 1})),
-        "info:to_play"_.Bind(Spec<int>({}, {0, 1})),
-        "info:is_selfplay"_.Bind(Spec<int>({}, {0, 1})),
-        "info:win_reason"_.Bind(Spec<int>({}, {-1, 1})));
+        "info:num_options"_.Bind(Spec<int>({}, std::tuple<int, int>{0, conf["max_options"_] - 1})),
+        "info:to_play"_.Bind(Spec<int>({}, std::tuple<int, int>{0, 1})),
+        "info:is_selfplay"_.Bind(Spec<int>({}, std::tuple<int, int>{0, 1})),
+        "info:win_reason"_.Bind(Spec<int>({}, std::tuple<int, int>{-1, 1})));
   }
   template <typename Config>
   static decltype(auto) ActionSpec(const Config &conf) {
     return MakeDict(
-        "action"_.Bind(Spec<int>({}, {0, conf["max_options"_] - 1})));
+        "action"_.Bind(Spec<int>({}, std::tuple<int, int>{0, conf["max_options"_] - 1})));
   }
 };
 
@@ -1761,7 +1927,7 @@ public:
       for (int j = _obs_action_feat_offset() + 1; j < ha.Shape()[1]; j++) {
         fmt::print(" {}", uint8_t(ha(i, j)));
       }
-      fmt::print("\n");
+      fmt::print(stderr, "\n");
     }
   }
 
@@ -1769,6 +1935,8 @@ public:
     // clock_t start = clock();
 
     int idx = action["action"_];
+    prev_msg_for_retry_ = msg_;
+    prev_option_for_retry_ = idx < options_.size() ? options_[idx] : "?";
     callback_(idx);
     // update_history_actions(to_play_, idx);
 
@@ -2113,6 +2281,13 @@ private:
       _set_obs_action_attrib(feat, i, 1 << (option[0] - '1'));
     } else if (msg == MSG_ANNOUNCE_NUMBER) {
       _set_obs_action_number(feat, i, option[0]);
+    } else if (msg == MSG_ANNOUNCE_RACE) {
+      _set_obs_action_number(feat, i, option[0]);
+    } else if (msg == MSG_ANNOUNCE_CARD) {
+      // option is the declared card code; expose its card-id embedding index
+      CardId cid = c_get_card_id(std::stoul(option));
+      feat(i, 0) = static_cast<uint8_t>(cid >> 8);
+      feat(i, 1) = static_cast<uint8_t>(cid & 0xff);
     } else {
       throw std::runtime_error("Unsupported message " + std::to_string(msg));
     }
@@ -2225,7 +2400,7 @@ private:
 		opts.payload4 = nullptr;
 
     opts.enableUnsafeLibraries = 1;
-    int create_status = OCG_CreateDuel(&pduel_, opts);
+    int create_status = OCG_CreateDuel(&pduel_, &opts);
     if (create_status != OCG_DUEL_CREATION_SUCCESS) {
       throw std::runtime_error("Failed to create duel");
     }
@@ -2243,7 +2418,7 @@ private:
     info.loc = location;
     info.seq = sequence;
     info.pos = position;
-    OCG_DuelNewCard(pduel, info);
+    OCG_DuelNewCard(pduel, &info);
   }
 
   void YGO_StartDuel(OCG_Duel pduel) {
@@ -2269,7 +2444,7 @@ private:
     // TODO: overlay
     OCG_QueryInfo info = {query_flag, playerid, location, sequence};
     uint32_t length;
-    auto buf_ = static_cast<uint8_t*>(OCG_DuelQuery(pduel, &length, info));
+    auto buf_ = static_cast<uint8_t*>(OCG_DuelQuery(pduel, &length, &info));
     if (length > 0) {
       memcpy(buf, buf_, length);      
     }
@@ -2284,7 +2459,7 @@ private:
     // TODO: overlay
     OCG_QueryInfo info = {query_flag, playerid, location};
     uint32_t length;
-    auto buf_ = static_cast<uint8_t*>(OCG_DuelQueryLocation(pduel, &length, info));
+    auto buf_ = static_cast<uint8_t*>(OCG_DuelQueryLocation(pduel, &length, &info));
     if (length > 0) {
       memcpy(buf, buf_, length);      
     }
@@ -2292,6 +2467,8 @@ private:
   }
 
   void YGO_SetResponsei(OCG_Duel pduel, int32_t value) {
+    prev_msg_for_retry_ = msg_;
+    prev_option_for_retry_ = fmt::format("i:{}", value);
     if (record_) {
       ReplayWriteInt8(4);
       ReplayWriteInt32(value);
@@ -2302,6 +2479,8 @@ private:
   }
 
   void YGO_SetResponseb(OCG_Duel pduel, uint8_t* buf, uint32_t len = 0) {
+    prev_msg_for_retry_ = msg_;
+    prev_option_for_retry_ = fmt::format("b:len={}", len);
     if (record_) {
       if (len == 0) {
         // len = buf[0];
@@ -2392,6 +2571,9 @@ private:
                                         n_action_feats * ha_p);
   }
 
+  int prev_msg_for_retry_ = 0;
+  std::string prev_option_for_retry_;
+
   void show_decision(int idx) {
     fmt::println("Player {} chose \"{}\" in {}", to_play_, options_[idx],
                  options_);
@@ -2460,6 +2642,8 @@ private:
         }
         if ((play_mode_ == kSelfPlay) || (to_play_ == ai_player_)) {
           if (options_.size() == 1) {
+            prev_msg_for_retry_ = msg_;
+            prev_option_for_retry_ = options_[0];
             callback_(0);
             update_h_card_ids(to_play_, 0);
             update_history_actions(to_play_, 0);
@@ -2471,7 +2655,9 @@ private:
           }
         } else {
           auto idx = players_[to_play_]->think(options_);
-          callback_(idx);
+          prev_msg_for_retry_ = msg_;
+    prev_option_for_retry_ = idx < options_.size() ? options_[idx] : "?";
+    callback_(idx);
           if (verbose_) {
             show_decision(idx);
           }
@@ -2496,8 +2682,9 @@ private:
     return v;
   }
 
-  uint32_t read_u64() {
-    uint32_t v = *reinterpret_cast<uint64_t *>(data_ + dp_);
+  uint64_t read_u64() {
+    uint64_t v;
+    memcpy(&v, data_ + dp_, 8);
     dp_ += 8;
     return v;
   }
@@ -2547,57 +2734,166 @@ private:
     return v;
   }
 
+  // --- TLV query parsing (modern edopro-core format) ---
+  // Each queried card is serialized as {u16 size, u32 query, payload[size-4]}
+  // entries terminated by {u16 4, u32 QUERY_END}; an empty zone slot is a
+  // single u16 0. See card::get_infos in ygopro-core/card.cpp.
+
+  struct QueryResult {
+    bool present = false;
+    CardCode code = 0;
+    uint32_t position = 0;
+    uint32_t level = 0;
+    uint32_t rank = 0;
+    uint32_t attack = 0;
+    uint32_t defense = 0;
+    uint32_t lscale = 0;
+    uint32_t rscale = 0;
+    uint32_t link = 0;
+    uint32_t link_marker = 0;
+    uint32_t counter = 0;
+    std::vector<CardCode> overlay_codes;
+  };
+
+  uint32_t q_at_u32(int off) const {
+    uint32_t v;
+    memcpy(&v, query_buf_ + off, 4);
+    return v;
+  }
+
+  // Parses one card block starting at qdp_; advances qdp_ past it.
+  // Returns false for an empty slot or an exhausted/truncated buffer.
+  bool q_parse_card_tlv(int32_t bl, QueryResult &r) {
+    if (qdp_ + 2 > bl) {
+      return false;
+    }
+    {
+      uint16_t first;
+      memcpy(&first, query_buf_ + qdp_, 2);
+      if (first == 0) {
+        qdp_ += 2;
+        return false;
+      }
+    }
+    while (qdp_ + 2 <= bl) {
+      uint16_t size;
+      memcpy(&size, query_buf_ + qdp_, 2);
+      qdp_ += 2;
+      if (size < 4 || qdp_ + size > bl) {
+        qdp_ = bl;
+        break;
+      }
+      int next = qdp_ + static_cast<int>(size);
+      uint32_t q = q_at_u32(qdp_);
+      int payload = qdp_ + 4;
+      switch (q) {
+      case QUERY_CODE:
+        r.code = q_at_u32(payload);
+        break;
+      case QUERY_POSITION:
+        r.position = q_at_u32(payload);
+        break;
+      case QUERY_LEVEL:
+        r.level = q_at_u32(payload);
+        break;
+      case QUERY_RANK:
+        r.rank = q_at_u32(payload);
+        break;
+      case QUERY_ATTACK:
+        r.attack = q_at_u32(payload);
+        break;
+      case QUERY_DEFENSE:
+        r.defense = q_at_u32(payload);
+        break;
+      case QUERY_LSCALE:
+        r.lscale = q_at_u32(payload);
+        break;
+      case QUERY_RSCALE:
+        r.rscale = q_at_u32(payload);
+        break;
+      case QUERY_LINK:
+        r.link = q_at_u32(payload);
+        r.link_marker = q_at_u32(payload + 4);
+        break;
+      case QUERY_OVERLAY_CARD: {
+        uint32_t n = q_at_u32(payload);
+        for (uint32_t i = 0; i < n; ++i) {
+          r.overlay_codes.push_back(q_at_u32(payload + 4 + 4 * i));
+        }
+        break;
+      }
+      case QUERY_COUNTERS: {
+        uint32_t n = q_at_u32(payload);
+        if (n > 0) {
+          r.counter = q_at_u32(payload + 4);
+        }
+        break;
+      }
+      default:
+        break;
+      }
+      qdp_ = next;
+      if (q == QUERY_END) {
+        break;
+      }
+    }
+    r.present = r.code != 0;
+    return r.present;
+  }
+
+  Card q_result_to_card(const QueryResult &r, PlayerId player, uint8_t loc,
+                        uint32_t seq) const {
+    Card c = c_get_card(r.code);
+    c.controler_ = player;
+    c.location_ = loc;
+    c.sequence_ = seq;
+    c.position_ = r.position;
+    if ((r.level & 0xff) > 0) {
+      c.level_ = r.level & 0xff;
+    }
+    if ((r.rank & 0xff) > 0) {
+      c.level_ = r.rank & 0xff;
+    }
+    c.attack_ = r.attack;
+    c.defense_ = r.defense;
+    c.lscale_ = r.lscale;
+    c.rscale_ = r.rscale;
+    // Pre-existing convention: link rating stored in level_, markers in
+    // defense_.
+    if ((r.link & 0xff) > 0) {
+      c.level_ = r.link & 0xff;
+    }
+    if (r.link_marker > 0) {
+      c.defense_ = r.link_marker;
+    }
+    c.counter_ = r.counter;
+    return c;
+  }
+
   CardCode get_card_code(PlayerId player, uint8_t loc, uint8_t seq) {
     int32_t flags = QUERY_CODE;
     int32_t bl = YGO_QueryCard(pduel_, player, loc, seq, flags, query_buf_);
     qdp_ = 0;
-    if (bl <= 0) {
+    QueryResult r;
+    if (bl <= 0 || !q_parse_card_tlv(bl, r)) {
       throw std::runtime_error("[get_card_code] Invalid card");
     }
-    return q_read_u32();
+    return r.code;
   }
 
   Card get_card(PlayerId player, uint8_t loc, uint8_t seq) {
     int32_t flags = QUERY_CODE | QUERY_POSITION | QUERY_LEVEL | QUERY_RANK |
                     QUERY_ATTACK | QUERY_DEFENSE | QUERY_LSCALE | QUERY_RSCALE |
                     QUERY_LINK;
-    int32_t bl  = YGO_QueryCard(pduel_, player, loc, seq, flags, query_buf_);
+    int32_t bl = YGO_QueryCard(pduel_, player, loc, seq, flags, query_buf_);
     qdp_ = 0;
-    if (bl <= 0) {
-      std::string err = fmt::format("Player: {}, loc: {}, seq: {}, length: {}", player, loc, seq, bl);
+    QueryResult r;
+    if (bl <= 0 || !q_parse_card_tlv(bl, r)) {
+      std::string err = fmt::format("Player: {}, loc: {}, seq: {}, length: {}",
+                                    player, loc, seq, bl);
       throw std::runtime_error("[get_card] Invalid card " + err);
     }
-    CardCode code = q_read_u32();
-    Card c = c_get_card(code);
-    uint32_t position = q_read_u32();
-    c.controler_ = player;
-    c.location_ = loc;
-    c.sequence_ = seq;
-    c.position_ = position;
-    uint32_t level = q_read_u32();
-    // TODO: check negative level
-    if ((level & 0xff) > 0) {
-      c.level_ = level & 0xff;
-    }
-    uint32_t rank = q_read_u32();
-    if ((rank & 0xff) > 0) {
-      c.level_ = rank & 0xff;
-    }
-    c.attack_ = q_read_u32();
-    c.defense_ = q_read_u32();
-    c.lscale_ = q_read_u32();
-    c.rscale_ = q_read_u32();
-
-    uint32_t link = q_read_u32();
-    uint32_t link_marker = q_read_u32_();
-    // TODO: fix this
-    if ((link & 0xff) > 0) {
-      c.level_ = link & 0xff;
-    }
-    if (link_marker > 0) {
-      c.defense_ = link_marker;
-    }
-    return c;
+    return q_result_to_card(r, player, loc, seq);
   }
 
   std::vector<Card> get_cards_in_location(PlayerId player, uint8_t loc) {
@@ -2606,90 +2902,36 @@ private:
                     QUERY_OVERLAY_CARD | QUERY_COUNTERS | QUERY_LSCALE |
                     QUERY_RSCALE | QUERY_LINK;
     int32_t bl = OCG_QueryFieldCard(pduel_, player, loc, flags, query_buf_, 0);
-
-    // fmt::println("player: {}, loc: {}, bl {}", player, location2str.at(loc), bl);
-    // print byte by byte
-    // for (int i = 0; i < bl; ++i) {
-    //   fmt::print("{:02x} ", query_buf_[i]);
-    // }
-    // fmt::print("\n");
-
+    if (std::getenv("YGOENV_QUERY_DEBUG")) {
+      fmt::print(stderr, "[qdbg] player={} loc={} bl={} bytes:", player, loc, bl);
+      for (int i = 0; i < std::min(bl, 32); ++i) {
+        fmt::print(stderr, " {:02x}", query_buf_[i]);
+      }
+      fmt::print("\n");
+    }
+    // OCG_DuelQueryLocation prefixes the buffer with a u32 total length
+    // (single-card OCG_DuelQuery does not).
     qdp_ = 4;
     std::vector<Card> cards;
-    while (true) {
-      if (qdp_ >= bl || bl - qdp_ < 136) {
-        break;
-      }
-      uint16_t v = q_read_u16_();
-      while (v == 0) {
-        v = q_read_u16_();
-      }
-      qdp_ += 4;
-
-      CardCode code = q_read_u32_();
-      Card c = c_get_card(code);
-
-      uint32_t position = q_read_u32();
-      c.controler_ = player;
-      c.location_ = loc;
-      // TODO: fix this
-      uint32_t sequence = 0;
-      c.sequence_ = sequence;
-      c.position_ = position;
-
-      uint32_t level = q_read_u32();
-    // TODO: check negative level
-      if ((level & 0xff) > 0) {
-        c.level_ = level & 0xff;
-      }
-      uint32_t rank = q_read_u32();
-      if ((rank & 0xff) > 0) {
-        c.level_ = rank & 0xff;
-      }
-      c.attack_ = q_read_u32();
-      c.defense_ = q_read_u32();
-
-      // TODO: equip_target
-      qdp_ += 16;
-
-      uint32_t n_xyz = q_read_u32();
-      for (int i = 0; i < n_xyz; ++i) {
-        auto code = q_read_u32_();
-        Card c_ = c_get_card(code);
-        c_.controler_ = player;
-        c_.location_ = loc | LOCATION_OVERLAY;
-        c_.sequence_ = sequence;
-        c_.position_ = i;
-        cards.push_back(c_);
-      }
-
-      // TODO: counters
-      uint32_t n_counters = q_read_u32();
-      for (int i = 0; i < n_counters; ++i) {
-        if (i == 0) {
-          c.counter_ = q_read_u32_();
-        }
-        else {
-          q_read_u32();
+    uint32_t seq = 0;
+    while (qdp_ + 2 <= bl) {
+      QueryResult r;
+      if (q_parse_card_tlv(bl, r)) {
+        cards.push_back(q_result_to_card(r, player, loc, seq));
+        for (uint32_t i = 0; i < r.overlay_codes.size(); ++i) {
+          Card c_ = c_get_card(r.overlay_codes[i]);
+          c_.controler_ = player;
+          c_.location_ = loc | LOCATION_OVERLAY;
+          c_.sequence_ = seq;
+          c_.position_ = i;
+          cards.push_back(c_);
         }
       }
-
-      c.lscale_ = q_read_u32();
-      c.rscale_ = q_read_u32();
-
-      uint32_t link = q_read_u32();
-      uint32_t link_marker = q_read_u32_();
-      if ((link & 0xff) > 0) {
-        c.level_ = link & 0xff;
-      }
-      if (link_marker > 0) {
-        c.defense_ = link_marker;
-      }
-      qdp_ += 6;
-      cards.push_back(c);
+      ++seq;
     }
     return cards;
   }
+
 
   std::vector<Card> read_cardlist(bool extra = false, bool extra8 = false) {
     std::vector<Card> cards;
@@ -3631,7 +3873,9 @@ private:
         loser->notify("You lost (" + l_reason + ").");
       }
     } else if (msg_ == MSG_RETRY) {
-      throw std::runtime_error("Retry");
+      throw std::runtime_error(fmt::format(
+          "Retry (prev msg {}, chosen option '{}')", prev_msg_for_retry_,
+          prev_option_for_retry_));
     } else if (msg_ == MSG_SELECT_BATTLECMD) {
       auto player = read_u8();
       auto activatable = read_cardlist_spec(true, true);
@@ -3822,11 +4066,23 @@ private:
           std::vector<int> comb(size);
           std::iota(comb.begin(), comb.end(), 0);
           std::shuffle(comb.begin(), comb.end(), gen_);
-          resp_buf_[0] = min;
-          for (int i = 0; i < min; ++i) {
-            resp_buf_[i + 1] = comb[i];
+          if (compat_mode_) {
+            resp_buf_[0] = min;
+            for (int i = 0; i < min; ++i) {
+              resp_buf_[i + 1] = comb[i];
+            }
+            YGO_SetResponseb(pduel_, resp_buf_);
+          } else {
+            // modern core: [i32 type=2][u32 count][u8 indices...]
+            int32_t rtype = 2;
+            uint32_t rsize = min;
+            memcpy(resp_buf_, &rtype, 4);
+            memcpy(resp_buf_ + 4, &rsize, 4);
+            for (int i = 0; i < min; ++i) {
+              resp_buf_[8 + i] = static_cast<uint8_t>(comb[i]);
+            }
+            YGO_SetResponseb(pduel_, resp_buf_, 8 + min);
           }
-          YGO_SetResponseb(pduel_, resp_buf_);
           discard_hand_ = false;
           return;
         }
@@ -3839,11 +4095,28 @@ private:
         show_deck(1-player);
         show_history_actions(1-player);
 
-        fmt::println("player: {}, min: {}, max: {}, size: {}", player, min, max, size);
-        std::cout << std::flush;
-        throw std::runtime_error(
-            fmt::format("Min > {} not implemented for select card",
-                        spec_.config["max_multi_select"_]));
+        // Fallback for selections larger than the action space supports:
+        // pick min random cards (uniform legal choice), as with discards.
+        std::vector<int> comb(size);
+        std::iota(comb.begin(), comb.end(), 0);
+        std::shuffle(comb.begin(), comb.end(), gen_);
+        if (compat_mode_) {
+          resp_buf_[0] = min;
+          for (int i = 0; i < min; ++i) {
+            resp_buf_[i + 1] = comb[i];
+          }
+          YGO_SetResponseb(pduel_, resp_buf_);
+        } else {
+          int32_t rtype = 2;
+          uint32_t rsize = min;
+          memcpy(resp_buf_, &rtype, 4);
+          memcpy(resp_buf_ + 4, &rsize, 4);
+          for (int i = 0; i < min; ++i) {
+            resp_buf_[8 + i] = static_cast<uint8_t>(comb[i]);
+          }
+          YGO_SetResponseb(pduel_, resp_buf_, 8 + min);
+        }
+        return;
       }
 
       max = std::min(max, uint32_t(spec_.config["max_multi_select"_]));
@@ -3884,12 +4157,13 @@ private:
           auto ret = GetSuitableReturn(maxseq, size);
           memcpy(resp_buf_, &ret, sizeof(ret));
           if (ret == 3) {
-            uint8_t v = 0;
+            // bitmap over all selectable indices: ceil((maxseq+1)/8) bytes
+            uint32_t nbytes = maxseq / 8 + 1;
+            memset(resp_buf_ + 4, 0, nbytes);
             for (int i = 0; i < comb.size(); ++i) {
-              v |= (1 << comb[i]);
+              resp_buf_[4 + comb[i] / 8] |= (1 << (comb[i] % 8));
             }
-            memcpy(resp_buf_ + 4, &v, sizeof(v));
-            YGO_SetResponseb(pduel_, resp_buf_, 5);
+            YGO_SetResponseb(pduel_, resp_buf_, 4 + nbytes);
           } else if (ret == 2) {
             memcpy(resp_buf_ + 4, &size, sizeof(size));
             for (int i = 0; i < size; ++i) {
@@ -4001,12 +4275,13 @@ private:
           auto ret = GetSuitableReturn(maxseq, size);
           memcpy(resp_buf_, &ret, sizeof(ret));
           if (ret == 3) {
-            uint8_t v = 0;
+            // bitmap over all selectable indices: ceil((maxseq+1)/8) bytes
+            uint32_t nbytes = maxseq / 8 + 1;
+            memset(resp_buf_ + 4, 0, nbytes);
             for (int i = 0; i < comb.size(); ++i) {
-              v |= (1 << comb[i]);
+              resp_buf_[4 + comb[i] / 8] |= (1 << (comb[i] % 8));
             }
-            memcpy(resp_buf_ + 4, &v, sizeof(v));
-            YGO_SetResponseb(pduel_, resp_buf_, 5);
+            YGO_SetResponseb(pduel_, resp_buf_, 4 + nbytes);
           } else if (ret == 2) {
             memcpy(resp_buf_ + 4, &size, sizeof(size));
             for (int i = 0; i < size; ++i) {
@@ -4036,11 +4311,7 @@ private:
       auto must_select_size = compat_read<uint8_t, uint32_t>();
 
       if (mode == 0) {
-        if (must_select_size != 1) {
-          throw std::runtime_error(
-              " must select size: " + std::to_string(must_select_size) +
-              " not implemented for MSG_SELECT_SUM");
-        }
+        // any must_select size: their values are subtracted from the target
       } else {
         if (min != 0 || max != 0 || must_select_size != 0) {
           std::string err = fmt::format(
@@ -4079,8 +4350,8 @@ private:
           must_select.push_back(card);
           must_select_params.push_back(param);
         }
-        if (must_select_size > 0) {
-          expected -= must_select_params[0] & 0xff;
+        for (int i = 0; i < must_select_size; ++i) {
+          expected -= must_select_params[i] & 0xffff;
         }
         auto pl = players_[player];
         pl->notify("Select cards with a total value of " +
@@ -4109,8 +4380,8 @@ private:
           must_select_specs.push_back(spec);
           must_select_params.push_back(param);
         }
-        if (must_select_size > 0) {
-          expected -= must_select_params[0] & 0xff;
+        for (int i = 0; i < must_select_size; ++i) {
+          expected -= must_select_params[i] & 0xffff;
         }
       }
 
@@ -4163,22 +4434,28 @@ private:
         }
       }
 
-      std::vector<std::vector<int>> card_levels;
+      std::vector<int> sum_o1(select_size), sum_o2(select_size);
       for (int i = 0; i < select_size; ++i) {
-        std::vector<int> levels;
-        int level1 = select_params[i] & 0xff;
-        int level2 = (select_params[i] >> 16);
-        if (level1 > 0) {
-          levels.push_back(level1);
-        }
-        if (level2 > 0) {
-          levels.push_back(level2);
-        }
-        card_levels.push_back(levels);
+        sum_o1[i] = select_params[i] & 0xffff;
+        sum_o2[i] = (select_params[i] >> 16) & 0xffff;
       }
-
-      std::vector<std::vector<int>> combs =
-          combinations_with_weight2(card_levels, expected, true);
+      // mode 0 = exact sum within [min,max] cards; mode 1 = minimal overflow
+      std::vector<std::vector<int>> combs;
+      {
+        std::vector<int> cur;
+        bool exact = (mode == 0);
+        int min_cnt = exact ? std::max(min, 1) : 1;
+        int max_cnt = exact ? std::max(max, min_cnt) : 8;
+        sum_combos_dfs(sum_o1, sum_o2, expected, exact, min_cnt, max_cnt, 0,
+                       cur, combs, 64);
+      }
+      if (std::getenv("YGOENV_QUERY_DEBUG")) {
+        fmt::print(stderr,
+                   "[sdbg] select_sum mode={} acc={} min={} max={} must={} "
+                   "expected={} params={} n_combs={}\n",
+                   mode, val, min, max, must_select_size, expected,
+                   fmt::join(select_params, ","), combs.size());
+      }
 
       for (const auto &comb : combs) {
         std::string option = "";
@@ -4209,20 +4486,17 @@ private:
         callback_ = [this, combs, must_select_size](int idx) {
           int32_t ret = 3;
           memcpy(resp_buf_, &ret, sizeof(ret));
-          uint8_t v = 0;
           const auto &comb = combs[idx];
-          // TODO: support more than 8 cards
-          if (must_select_size + comb.size() > 8) {
-            throw std::runtime_error("must_select_size + comb.size() > 8");
+          uint32_t maxidx = 0;
+          for (int c : comb) {
+            maxidx = std::max(maxidx, static_cast<uint32_t>(c));
           }
-          // for (int i = 0; i < must_select_size; ++i) {
-          //   v |= (1 << i);
-          // }
+          uint32_t nbytes = maxidx / 8 + 1;
+          memset(resp_buf_ + 4, 0, nbytes);
           for (int i = 0; i < comb.size(); ++i) {
-            v |= (1 << (comb[i]));
+            resp_buf_[4 + comb[i] / 8] |= (1 << (comb[i] % 8));
           }
-          memcpy(resp_buf_ + 4, &v, sizeof(v));
-          YGO_SetResponseb(pduel_, resp_buf_, 5);
+          YGO_SetResponseb(pduel_, resp_buf_, 4 + nbytes);
         };
       }
 
@@ -4713,6 +4987,10 @@ private:
         numbers.push_back(number);
         options_.push_back(std::string(1, '0' + number));
       }
+      if (std::getenv("YGOENV_QUERY_DEBUG")) {
+        fmt::print(stderr, "[adbg] announce_number player={} count={} numbers={}\n",
+                   player, count, fmt::join(numbers, ","));
+      }
       if (verbose_) {
         auto pl = players_[player];
         std::string str = "Select a number, one of: [";
@@ -4727,6 +5005,9 @@ private:
       }
       to_play_ = player;
       callback_ = [this](int idx) {
+        if (std::getenv("YGOENV_QUERY_DEBUG")) {
+          fmt::print(stderr, "[adbg] announce_number respond idx={}\n", idx);
+        }
         YGO_SetResponsei(pduel_, idx);
       };
     } else if (msg_ == MSG_ANNOUNCE_ATTRIB) {
@@ -4782,6 +5063,58 @@ private:
         YGO_SetResponsei(pduel_, resp);
       };
 
+    } else if (msg_ == MSG_ANNOUNCE_RACE) {
+      auto player = read_u8();
+      int count = read_u8();
+      uint64_t available = read_u64();
+      if (count != 1) {
+        throw std::runtime_error("Announce race count " +
+                                 std::to_string(count) + " not implemented");
+      }
+      for (int i = 0; i < 64; ++i) {
+        if (available & (1ULL << i)) {
+          options_.push_back(std::string(1, static_cast<char>('0' + i)));
+        }
+      }
+      if (verbose_) {
+        players_[player]->notify("Announce a race");
+      }
+      to_play_ = player;
+      callback_ = [this](int idx) {
+        uint64_t resp = 1ULL << (options_[idx][0] - '0');
+        memcpy(resp_buf_, &resp, 8);
+        YGO_SetResponseb(pduel_, resp_buf_, 8);
+      };
+    } else if (msg_ == MSG_ANNOUNCE_CARD) {
+      auto player = read_u8();
+      int count = read_u8();
+      std::vector<uint64_t> opcodes;
+      for (int i = 0; i < count; ++i) {
+        opcodes.push_back(read_u64());
+      }
+      std::vector<CardCode> candidates;
+      for (const auto &[code, data] : cards_data_) {
+        if (data.code != 0 && is_declarable(data, opcodes)) {
+          candidates.push_back(code);
+        }
+      }
+      if (candidates.empty()) {
+        throw std::runtime_error("No declarable cards for announce card");
+      }
+      std::sort(candidates.begin(), candidates.end());
+      for (const auto &code : candidates) {
+        options_.push_back(std::to_string(code));
+      }
+      if (verbose_) {
+        players_[player]->notify("Declare a card, " +
+                                 std::to_string(candidates.size()) +
+                                 " candidates");
+      }
+      to_play_ = player;
+      callback_ = [this](int idx) {
+        YGO_SetResponsei(pduel_,
+                         static_cast<int32_t>(std::stoul(options_[idx])));
+      };
     } else if (msg_ == MSG_SELECT_POSITION) {
       auto player = read_u8();
       auto code = read_u32();
