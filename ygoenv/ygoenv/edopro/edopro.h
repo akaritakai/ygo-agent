@@ -899,29 +899,24 @@ public:
 
   std::string get_position() const { return position_to_string(position_); }
 
-  std::string get_effect_description(uint32_t desc,
+  std::string get_effect_description(uint64_t desc,
                                      bool existing = false) const {
+    // Modern edopro-core packs card-string descs as (code << 20) | index;
+    // values below 1<<20 are system strings.
     std::string s;
     bool e = false;
-    auto code = code_;
-    if (desc > 10000) {
-      code = desc >> 4;
-    }
-    uint32_t offset = desc - code_ * 16;
-    bool in_range = (offset >= 0) && (offset < strings_.size());
-    std::string str = "";
-    if (in_range) {
-      str = ltrim(strings_[offset]);
-    }
-    if (in_range || desc == 0) {
-      if ((desc == 0) || str.empty()) {
+    uint32_t offset = static_cast<uint32_t>(desc & 0xfffff);
+    bool is_card_desc = (desc >> 20) != 0;
+    if (desc == 0 || (is_card_desc && offset < strings_.size())) {
+      std::string str = is_card_desc ? ltrim(strings_[offset]) : "";
+      if (str.empty()) {
         s = "Activate " + name_ + ".";
       } else {
         s = name_ + " (" + str + ")";
         e = true;
       }
     } else {
-      s = get_system_string(desc);
+      s = get_system_string(static_cast<uint32_t>(desc));
       if (!s.empty()) {
         e = true;
       }
@@ -1365,6 +1360,13 @@ static void init_module(const std::string &db_path,
       all_codes.push_back(code);
     }
     preload_deck(db, all_codes, true);
+  }
+
+  // code 0 appears in messages for hidden/face-down cards (e.g. face-down
+  // special summons write code 0): give c_get_card a uniform placeholder.
+  if (cards_.find(0) == cards_.end()) {
+    cards_[0] = Card(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "[hidden]", "", {});
+    card_ids_[0] = 0;
   }
 
   for (const auto &[name, deck] : decks) {
@@ -2654,7 +2656,7 @@ private:
     // Tournament Policy v2.5 judge call instead (send the primary-cause card
     // to the GY via injected Lua and continue play).
     int64_t process_iters = 0;
-    const int64_t kProcessBudget = 1000000;
+    const int64_t kProcessBudget = 100000;
     while (duel_started_) {
       if (duel_status_ == OCG_DUEL_STATUS_END) {
         break;
@@ -2692,6 +2694,17 @@ private:
       }
       while (dp_ != fdl_) {
         handle_message();
+        // Desync guard: a handler that under-reads its payload would make the
+        // next message parse from garbage (and can run off the buffer). Snap
+        // to the declared end and warn so goldens surface the bug.
+        if (dp_ != dl_) {
+          if (std::getenv("YGOENV_CORE_LOG") || verbose_) {
+            fmt::print(stderr,
+                       "[env] WARNING: msg {} consumed {} of {} bytes\n",
+                       msg_, dp_, dl_);
+          }
+          dp_ = dl_;
+        }
         if (options_.empty()) {
           continue;
         }
@@ -3071,6 +3084,10 @@ private:
   void handle_message() {
     int l_ = read_u32();
     dl_ = dp_ + l_;
+    if (dl_ > fdl_) {
+      throw std::runtime_error(
+          fmt::format("message length {} overruns buffer {}", dl_, fdl_));
+    }
     msg_ = int(data_[dp_++]);
     options_ = {};
 
@@ -3665,7 +3682,7 @@ private:
         return;
       }
       auto player = read_u8();
-      auto count = read_u8();
+      auto count = compat_read<uint8_t, uint32_t>();
       for (int i = 0; i < count; ++i) {
         read_u32();
       }
@@ -4752,20 +4769,18 @@ private:
             throw std::runtime_error("Unknown effectyn desc " +
                                      std::to_string(desc) + " of " + name);
           }
-        }  else if (desc < 10000u) {
+        }  else if (desc < (1u << 20)) {
           s = get_system_string(desc);
         } else {
-          CardCode code = (desc >> 4) & 0x0fffffff;
-          uint32_t offset = desc & 0xf;
-          if (cards_.find(code) != cards_.end()) {
-            auto &card_ = c_get_card(code);
-            s = card_.strings_[offset];
-            if (s.empty()) {
-              s = "???";
-            }
-          } else {
-            throw std::runtime_error("Unknown effectyn desc " +
-                                     std::to_string(desc) + " of " + name);
+          // modern packing: (code << 20) | string index
+          CardCode code = static_cast<CardCode>(desc >> 20);
+          uint32_t offset = static_cast<uint32_t>(desc & 0xfffff);
+          auto it = cards_.find(code);
+          if (it != cards_.end() && offset < it->second.strings_.size()) {
+            s = it->second.strings_[offset];
+          }
+          if (s.empty()) {
+            s = "???";
           }
         }
         pl->notify(s);
