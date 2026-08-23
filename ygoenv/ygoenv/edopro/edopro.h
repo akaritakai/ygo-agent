@@ -1311,19 +1311,38 @@ inline const char *read_card_script(const std::string &path, int *lenptr) {
 }
 
 inline int g_ScriptReader(void* payload, OCG_Duel duel, const char* name) {
+  // Called concurrently by every env thread (scripts load lazily on first
+  // use). Copy the cache entry out under a lock and never hold an iterator
+  // across an unlocked region: unordered_dense invalidates iterators on
+  // insert, so the previous "unlock, load, re-find, read outside the lock"
+  // shape raced with concurrent inserts (observed as release-build segfaults
+  // seconds into a run, when script loading is heaviest).
   std::string path(name);
-  std::shared_lock<std::shared_timed_mutex> lock(scripts_mtx);
-  auto it = cards_script_.find(path);
-  if (it == cards_script_.end()) {
-    lock.unlock();
-    int len;
+  card_script entry{nullptr, 0};
+  bool found = false;
+  {
+    std::shared_lock<std::shared_timed_mutex> lock(scripts_mtx);
+    auto it = cards_script_.find(path);
+    if (it != cards_script_.end()) {
+      entry = it->second;
+      found = true;
+    }
+  }
+  if (!found) {
+    int len = 0;
     const char *buf = read_card_script(path, &len);
     std::unique_lock<std::shared_timed_mutex> ulock(scripts_mtx);
-    cards_script_[path] = {buf, len};
-    it = cards_script_.find(path);
+    auto [it, inserted] = cards_script_.try_emplace(path, card_script{buf, len});
+    if (!inserted && buf != nullptr) {
+      // another thread loaded the same script first; drop our copy so the
+      // cached pointer stays immutable for the process lifetime
+      delete[] buf;
+    }
+    entry = it->second;
   }
-  int len = it->second.len;
-  auto res = len && OCG_LoadScript(duel, it->second.buf, static_cast<uint32_t>(len), name);
+  // Safe unlocked: cache entries are immutable once inserted.
+  auto res = entry.len && OCG_LoadScript(duel, entry.buf,
+                                         static_cast<uint32_t>(entry.len), name);
   // if (!res) {
   //   fmt::print("Failed to load script: {}\n", path);
   // }
@@ -1614,7 +1633,10 @@ protected:
   PlayerId ai_player_;
 
   OCG_Duel pduel_;
-  Player *players_[2]; //  abstract class must be pointer
+  // Value-initialized: Reset() and ~EDOProEnv() both delete non-null entries,
+  // so indeterminate values here are a delete of garbage (crashes whenever the
+  // object lands on recycled heap rather than fresh zeroed pages).
+  Player *players_[2]{}; //  abstract class must be pointer
 
   std::uniform_int_distribution<uint64_t> dist_int_;
   bool done_{true};
