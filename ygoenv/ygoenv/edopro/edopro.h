@@ -1552,7 +1552,12 @@ public:
                     // Forcing the duel seed makes an incident exactly
                     // reproducible: (deck1, deck2, duel_seed, actions) is a
                     // complete case file for judge-style investigation.
-                    "duel_seed"_.Bind(0));
+                    "duel_seed"_.Bind(0),
+                    // EDOPro single-mode puzzle: a Lua script that builds the
+                    // board with Debug.AddCard/SetPlayerInfo/ReloadFieldEnd.
+                    // When set, it replaces deck loading, giving small
+                    // targeted scenarios with known-correct answers.
+                    "puzzle"_.Bind(std::string("")));
   }
   template <typename Config>
   static decltype(auto) StateSpec(const Config &conf) {
@@ -1612,6 +1617,7 @@ constexpr uint64_t duel_options_ = DUEL_MODE_MR5;
 
 class EDOProEnv : public Env<EDOProEnvSpec> {
 protected:
+  std::string puzzle_path_;
   std::string deck1_;
   std::string deck2_;
   std::vector<uint32_t> main_deck0_;
@@ -1722,6 +1728,7 @@ public:
         max_episode_steps_(spec.config["max_episode_steps"_]),
         elapsed_step_(max_episode_steps_ + 1), dist_int_(0, 0xffffffff),
         deck1_(spec.config["deck1"_]), deck2_(spec.config["deck2"_]),
+        puzzle_path_(spec.config["puzzle"_]),
         player_(spec.config["player"_]),
         play_modes_(parse_play_modes(spec.config["play_mode"_])),
         verbose_(spec.config["verbose"_]), record_(spec.config["record"_]),
@@ -1822,8 +1829,24 @@ public:
       } else {
         players_[i] = new GreedyAI(nickname_[i], init_lp, i, verbose_);
       }
-      load_deck(i);
+      if (puzzle_path_.empty()) {
+        load_deck(i);
+      }
       lp_[i] = players_[i]->init_lp_;
+    }
+    if (!puzzle_path_.empty()) {
+      std::ifstream pf(puzzle_path_, std::ios::binary);
+      if (!pf) {
+        throw std::runtime_error("puzzle script not found: " + puzzle_path_);
+      }
+      std::string script((std::istreambuf_iterator<char>(pf)),
+                         std::istreambuf_iterator<char>());
+      if (!OCG_LoadScript(pduel_, script.c_str(),
+                          static_cast<uint32_t>(script.size()),
+                          puzzle_path_.c_str())) {
+        throw std::runtime_error("puzzle script failed to load: " +
+                                 puzzle_path_);
+      }
     }
 
     if (record_) {
@@ -3764,6 +3787,17 @@ private:
       auto op = players_[1 - player];
       pl->notify("You shuffled your deck.");
       op->notify(pl->nickname_ + " shuffled their deck.");
+    } else if (msg_ == MSG_RELOAD_FIELD) {
+      // Full field resync: emitted by Debug.ReloadFieldEnd() (puzzle setup)
+      // and by the server on reconnection. The observation is rebuilt from
+      // OCG_DuelQuery* rather than tracked from messages, so the payload can
+      // be skipped — but it must be consumed, not treated as unknown.
+      dp_ = dl_;
+      if (verbose_) {
+        players_[0]->notify("Field reloaded.");
+        players_[1]->notify("Field reloaded.");
+      }
+      return;
     } else if (msg_ == MSG_SHUFFLE_EXTRA) {
       if (!verbose_) {
         dp_ = dl_;
