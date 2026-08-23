@@ -1548,7 +1548,11 @@ public:
                     "play_mode"_.Bind(std::string("bot")),
                     "verbose"_.Bind(false), "max_options"_.Bind(16),
                     "max_cards"_.Bind(75), "n_history_actions"_.Bind(16),
-                    "max_multi_select"_.Bind(5), "record"_.Bind(false));
+                    "max_multi_select"_.Bind(5), "record"_.Bind(false),
+                    // Forcing the duel seed makes an incident exactly
+                    // reproducible: (deck1, deck2, duel_seed, actions) is a
+                    // complete case file for judge-style investigation.
+                    "duel_seed"_.Bind(0));
   }
   template <typename Config>
   static decltype(auto) StateSpec(const Config &conf) {
@@ -1636,6 +1640,12 @@ protected:
   // Value-initialized: Reset() and ~EDOProEnv() both delete non-null entries,
   // so indeterminate values here are a delete of garbage (crashes whenever the
   // object lands on recycled heap rather than fresh zeroed pages).
+  // Incident case file: replaying (deck1, deck2, duel_seed, action_history)
+  // reproduces a duel exactly, so loops can be investigated as a judge would
+  // rather than guessed at from thresholds.
+  uint32_t duel_seed_ = 0;
+  std::vector<int> action_history_;
+
   // Involuntary-loop detection (see MSG_CHAINING handler)
   uint64_t chains_since_decision_ = 0;
   CardCode loop_cause_code_ = 0;
@@ -1782,7 +1792,10 @@ public:
     ha_p_0_ = 0;
     ha_p_1_ = 0;
 
-    auto duel_seed = dist_int_(gen_);
+    uint32_t forced_seed = static_cast<uint32_t>(spec_.config["duel_seed"_]);
+    auto duel_seed = forced_seed != 0 ? forced_seed : dist_int_(gen_);
+    duel_seed_ = duel_seed;
+    action_history_.clear();
 
     constexpr uint32_t init_lp = 8000;
     constexpr uint32_t startcount = 5;
@@ -1974,6 +1987,7 @@ public:
     // clock_t start = clock();
 
     int idx = action["action"_];
+    action_history_.push_back(idx);
     prev_msg_for_retry_ = msg_;
     prev_option_for_retry_ = idx < options_.size() ? options_[idx] : "?";
     callback_(idx);
@@ -2629,6 +2643,24 @@ private:
   int prev_msg_for_retry_ = 0;
   std::string prev_option_for_retry_;
 
+  void report_loop_incident(const char *cause) {
+    if (std::getenv("YGOENV_NO_INCIDENTS")) {
+      return;
+    }
+    std::string acts;
+    acts.reserve(action_history_.size() * 4);
+    for (size_t i = 0; i < action_history_.size(); ++i) {
+      if (i) acts += ",";
+      acts += std::to_string(action_history_[i]);
+    }
+    fmt::print(stderr,
+               "[incident] {{\"cause\":\"{}\",\"deck1\":\"{}\",\"deck2\":\"{}\","
+               "\"duel_seed\":{},\"turn\":{},\"last_chain_code\":{},"
+               "\"chains_since_decision\":{},\"actions\":[{}]}}\n",
+               cause, deck_name_[0], deck_name_[1], duel_seed_, turn_count_,
+               loop_cause_code_, chains_since_decision_, acts);
+  }
+
   void show_decision(int idx) {
     fmt::println("Player {} chose \"{}\" in {}", to_play_, options_[idx],
                  options_);
@@ -2692,6 +2724,7 @@ private:
       }
 
       if (++process_iters >= kProcessBudget) {
+        report_loop_incident("process_budget");
         done_ = true;
         winner_ = 255;  // truncation draw
         duel_started_ = false;
@@ -2705,6 +2738,7 @@ private:
         fdl_ = YGO_GetMessage(pduel_, data_);
         if (fdl_ == 0) {
           if (duel_status_ == OCG_DUEL_STATUS_CONTINUE) {
+            report_loop_incident("lua_budget");
             // CONTINUE with an empty buffer only happens when the core's
             // script instruction budget tripped (see the lua-budget core
             // patch): the duel is stuck in an unbounded loop. Interim
@@ -4017,10 +4051,7 @@ private:
             "Retry (prev msg {}, chosen option '{}')", prev_msg_for_retry_,
             prev_option_for_retry_));
       }
-      if (std::getenv("YGOENV_CORE_LOG")) {
-        fmt::print(stderr, "[env] MSG_RETRY (prev msg {}, option '{}'): truncating episode\n",
-                   prev_msg_for_retry_, prev_option_for_retry_);
-      }
+      report_loop_incident("msg_retry");
       done_ = true;
       winner_ = 255;
       duel_started_ = false;
