@@ -2716,6 +2716,15 @@ private:
       }
       while (dp_ != fdl_) {
         handle_message();
+        // A handler may end the duel mid-buffer (loop-guard truncation,
+        // MSG_RETRY abort, MSG_WIN). The remaining bytes belong to a duel
+        // that no longer exists, and dp_/fdl_ have been reset, so continuing
+        // to parse them reads garbage. Break rather than return: the
+        // end-of-duel bookkeeping (done_ = true, options_.clear()) lives
+        // after the loops, and _duel_end() does not set done_ itself.
+        if (!duel_started_) {
+          break;
+        }
         // Desync guard: a handler that under-reads its payload would make the
         // next message parse from garbage (and can run off the buffer). Snap
         // to the declared end and warn so goldens surface the bug.
