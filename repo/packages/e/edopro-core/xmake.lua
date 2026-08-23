@@ -2,8 +2,10 @@ package("edopro-core")
 
     set_homepage("https://github.com/edo9300/ygopro-core")
 
-    -- Build from the project's vendored core (pinned commit: see VENDORED.md)
-    -- for rules parity with EDOPro 41.0.2, instead of cloning upstream HEAD.
+    -- Build from the parent project's vendored core (pinned submodule commit)
+    -- for rules parity with EDOPro 41.0.2, with local patches applied to an
+    -- out-of-tree copy so the submodule stays pristine (and free of build
+    -- artifacts). Patches live in the parent project's bot/patches/.
     set_sourcedir(path.join(os.scriptdir(), "..", "..", "..", "..", "..", "..",
                             "simulator", "ygopro-core"))
 
@@ -16,6 +18,20 @@ package("edopro-core")
     end)
 
     on_install("linux", function (package)
+        local root = path.join(os.scriptdir(), "..", "..", "..", "..", "..", "..")
+        local builddir = path.join(package:cachedir(), "patched-src")
+        os.tryrm(builddir)
+        os.mkdir(builddir)
+        os.cp("*.cpp", builddir)
+        os.cp("*.h", builddir)
+        os.cp("RNG", builddir)
+        local patches = {
+            path.join(root, "bot", "patches", "ygopro-core-lua-budget.patch"),
+        }
+        os.cd(builddir)
+        for _, p in ipairs(patches) do
+            os.vrunv("patch", {"-p1", "-i", p})
+        end
         io.writefile("xmake.lua", [[
             add_rules("mode.debug", "mode.release")
             target("edopro-core")

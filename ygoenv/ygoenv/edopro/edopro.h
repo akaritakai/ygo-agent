@@ -1726,6 +1726,10 @@ public:
 
   void Reset() override {
     // clock_t start = clock();
+    // A truncated (loop-guard) episode can leave stale message-buffer
+    // indices; parsing leftovers as the new duel's stream desyncs everything.
+    dp_ = 0;
+    fdl_ = 0;
     if (random_mode()) {
       play_mode_ = play_modes_[dist_int_(gen_) % play_modes_.size()];
     } else {
@@ -2642,15 +2646,46 @@ private:
   }
 
   void next() {
+    // Per-decision processing budget (loop guard, layer a): an involuntary
+    // multi-card loop cycles this drive loop with every script call finite.
+    // Victory-condition loops (deck-out, LP 0) resolve naturally well inside
+    // the budget; tripping it means no victory condition is reachable.
+    // Interim adjudication: truncation draw. TODO(policy): emulate the
+    // Tournament Policy v2.5 judge call instead (send the primary-cause card
+    // to the GY via injected Lua and continue play).
+    int64_t process_iters = 0;
+    const int64_t kProcessBudget = 1000000;
     while (duel_started_) {
       if (duel_status_ == OCG_DUEL_STATUS_END) {
         break;
+      }
+
+      if (++process_iters >= kProcessBudget) {
+        done_ = true;
+        winner_ = 255;  // truncation draw
+        duel_started_ = false;
+        dp_ = 0;
+        fdl_ = 0;
+        return;
       }
 
       if (dp_ == fdl_) {
         duel_status_ = YGO_Process(pduel_);
         fdl_ = YGO_GetMessage(pduel_, data_);
         if (fdl_ == 0) {
+          if (duel_status_ == OCG_DUEL_STATUS_CONTINUE) {
+            // CONTINUE with an empty buffer only happens when the core's
+            // script instruction budget tripped (see the lua-budget core
+            // patch): the duel is stuck in an unbounded loop. Interim
+            // adjudication: truncation draw. TODO(policy): Tournament Policy
+            // v2.5 judge emulation (remove the primary-cause card, resume).
+            done_ = true;
+            winner_ = 255;
+            duel_started_ = false;
+            dp_ = 0;
+            fdl_ = 0;
+            return;
+          }
           continue;
         }
         dp_ = 0;
@@ -3893,9 +3928,25 @@ private:
         loser->notify("You lost (" + l_reason + ").");
       }
     } else if (msg_ == MSG_RETRY) {
-      throw std::runtime_error(fmt::format(
-          "Retry (prev msg {}, chosen option '{}')", prev_msg_for_retry_,
-          prev_option_for_retry_));
+      // After a script-budget trip the duel state can be inconsistent and
+      // reject all responses; treat retry as unrecoverable and truncate the
+      // episode as a draw. YGOENV_STRICT=1 restores the hard error for
+      // debugging response-format bugs.
+      if (std::getenv("YGOENV_STRICT")) {
+        throw std::runtime_error(fmt::format(
+            "Retry (prev msg {}, chosen option '{}')", prev_msg_for_retry_,
+            prev_option_for_retry_));
+      }
+      if (std::getenv("YGOENV_CORE_LOG")) {
+        fmt::print(stderr, "[env] MSG_RETRY (prev msg {}, option '{}'): truncating episode\n",
+                   prev_msg_for_retry_, prev_option_for_retry_);
+      }
+      done_ = true;
+      winner_ = 255;
+      duel_started_ = false;
+      dp_ = 0;
+      fdl_ = 0;
+      return;
     } else if (msg_ == MSG_SELECT_BATTLECMD) {
       auto player = read_u8();
       auto activatable = read_cardlist_spec(true, true);
