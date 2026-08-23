@@ -35,6 +35,8 @@ from ygoai.rl.jax.switch import truncated_gae_2p0s as gae_2p0s_switch
 os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
 
 
+from ygoai.rl.jax import device_put_sharded as _device_put_sharded
+
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__).rstrip(".py")
@@ -470,17 +472,17 @@ def rollout(
         for x in partitioned_storage:
             if isinstance(x, dict):
                 x = {
-                    k: jax.device_put_sharded(v, devices=learner_devices)
+                    k: _device_put_sharded(v, devices=learner_devices)
                     for k, v in x.items()
                 }
             else:
-                x = jax.device_put_sharded(x, devices=learner_devices)
+                x = _device_put_sharded(x, devices=learner_devices)
             sharded_storage.append(x)
         sharded_storage = Transition(*sharded_storage)
         next_main = main_player == next_to_play
         next_rstate = jax.tree.map(
             lambda x1, x2: jnp.where(next_main[:, None], x1, x2), next_rstate1, next_rstate2)
-        sharded_data = jax.tree.map(lambda x: jax.device_put_sharded(
+        sharded_data = jax.tree.map(lambda x: _device_put_sharded(
                 np.split(x, len(learner_devices)), devices=learner_devices),
                          (init_rstate1, init_rstate2, (next_obs, next_rstate), next_main))
 
@@ -632,7 +634,7 @@ def main():
 
     key = jax.random.PRNGKey(args.real_seed)
     key, *learner_keys = jax.random.split(key, len(learner_devices) + 1)
-    learner_keys = jax.device_put_sharded(learner_keys, devices=learner_devices)
+    learner_keys = _device_put_sharded(learner_keys, devices=learner_devices)
     actor_keys = jax.random.split(key, len(actor_devices) * args.num_actor_threads)
 
     deck, deck_names = init_ygopro(args.env_id, "english", args.deck, args.code_list_file, return_deck_names=True)

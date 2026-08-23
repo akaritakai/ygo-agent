@@ -537,3 +537,15 @@ def simple_policy_loss(ratios, logits, new_logits, advantages, kld_max, eps=1e-1
     result = (d_ratio + sign_a - 1) * sign_a
     pg_loss = -advs * ratios * result
     return pg_loss
+
+def device_put_sharded(xs, devices):
+    """Compat shim for jax.device_put_sharded, removed in JAX 0.10.
+
+    Original semantics: given one array per device, stack them along a new
+    leading axis and place shard i on devices[i].
+    """
+    import numpy as _np
+    xs = list(xs)
+    mesh = jax.sharding.Mesh(_np.array(devices), ("x",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("x"))
+    return jax.device_put(jnp.stack(xs), sharding)

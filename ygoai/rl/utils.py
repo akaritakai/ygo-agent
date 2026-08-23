@@ -1,7 +1,10 @@
 import re
 
 import optree
-import torch
+try:  # torch is only needed by the legacy torch trainers, not the JAX ones
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None
 
 from ygoai.rl.env import RecordEpisodeStatistics, EnvPreprocess
     
@@ -53,5 +56,7 @@ def masked_normalize(x, valid, eps=1e-8):
 
 
 def to_tensor(x, device, dtype=None):
+    if torch is None:
+        raise ImportError("to_tensor requires torch (only the legacy torch trainers use it)")
     return optree.tree_map(lambda x: torch.from_numpy(x).to(device=device, dtype=dtype, non_blocking=True), x)
 

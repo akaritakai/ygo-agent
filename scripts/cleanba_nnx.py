@@ -39,6 +39,8 @@ from ygoai.rl.jax import clipped_surrogate_pg_loss, mse_loss, entropy_loss, simp
 os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
 
 
+from ygoai.rl.jax import device_put_sharded as _device_put_sharded
+
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__).rstrip(".py")
@@ -570,16 +572,16 @@ def rollout(
         for x in partitioned_storage:
             if isinstance(x, dict):
                 x = {
-                    k: jax.device_put_sharded(v, devices=learner_devices) if v is not None else None
+                    k: _device_put_sharded(v, devices=learner_devices) if v is not None else None
                     for k, v in x.items()
                 }
             elif x is not None:
-                x = jax.device_put_sharded(x, devices=learner_devices)
+                x = _device_put_sharded(x, devices=learner_devices)
             sharded_storage.append(x)
         sharded_storage = Transition(*sharded_storage)
 
         init_rstate = init_rstates.pop(0)
-        sharded_data = jax.tree.map(lambda x: jax.device_put_sharded(
+        sharded_data = jax.tree.map(lambda x: _device_put_sharded(
                 np.split(x, len(learner_devices)), devices=learner_devices),
                          (init_rstate, next_data))
 
@@ -736,7 +738,7 @@ def main():
 
     key = jax.random.PRNGKey(args.real_seed)
     key, *learner_keys = jax.random.split(key, len(learner_devices) + 1)
-    learner_keys = jax.device_put_sharded(learner_keys, devices=learner_devices)
+    learner_keys = _device_put_sharded(learner_keys, devices=learner_devices)
     actor_keys = jax.random.split(key, len(actor_devices) * args.num_actor_threads)
 
     deck, deck_names = init_ygopro(args.env_id, "english", args.deck, args.code_list_file, return_deck_names=True)
