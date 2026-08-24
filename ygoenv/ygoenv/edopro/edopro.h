@@ -846,6 +846,7 @@ protected:
   uint32_t sequence_ = 0;
   uint32_t position_ = 0;
   uint32_t counter_ = 0;
+  uint32_t status_ = 0;
 
 public:
   Card() = default;
@@ -1552,7 +1553,7 @@ public:
                     "deck2"_.Bind(std::string("OldSchool")), "player"_.Bind(-1),
                     "play_mode"_.Bind(std::string("bot")),
                     "verbose"_.Bind(false), "max_options"_.Bind(16),
-                    "max_cards"_.Bind(75), "n_history_actions"_.Bind(16),
+                    "max_cards"_.Bind(80), "n_history_actions"_.Bind(16),
                     "max_multi_select"_.Bind(5), "record"_.Bind(false),
                     // Forcing the duel seed makes an incident exactly
                     // reproducible: (deck1, deck2, duel_seed, actions) is a
@@ -1568,14 +1569,22 @@ public:
                     // board with Debug.AddCard/SetPlayerInfo/ReloadFieldEnd.
                     // When set, it replaces deck loading, giving small
                     // targeted scenarios with known-correct answers.
-                    "puzzle"_.Bind(std::string("")));
+                    "puzzle"_.Bind(std::string("")),
+                    // ygopro-layout config keys (D4 obs port; see
+                    // notes/06-obs-port-plan.md). max_steps: episode decision
+                    // cap; 0 = fall back to the envpool-common
+                    // max_episode_steps so existing tools keep their
+                    // behaviour (the upstream trainer always passes it).
+                    "async_reset"_.Bind(false), "greedy_reward"_.Bind(true),
+                    "timeout"_.Bind(600), "oppo_info"_.Bind(false),
+                    "max_steps"_.Bind(0));
   }
   template <typename Config>
   static decltype(auto) StateSpec(const Config &conf) {
     int n_action_feats = 10 + conf["max_multi_select"_] * 2;
     return MakeDict(
-        "obs:cards_"_.Bind(Spec<uint8_t>({conf["max_cards"_] * 2, 40})),
-        "obs:global_"_.Bind(Spec<uint8_t>({9})),
+        "obs:cards_"_.Bind(Spec<uint8_t>({conf["max_cards"_] * 2, 41})),
+        "obs:global_"_.Bind(Spec<uint8_t>({23})),
         "obs:actions_"_.Bind(
             Spec<uint8_t>({conf["max_options"_], n_action_feats})),
         "obs:h_actions_"_.Bind(
@@ -1737,7 +1746,11 @@ protected:
 public:
   EDOProEnv(const Spec &spec, int env_id)
       : Env<EDOProEnvSpec>(spec, env_id),
-        max_episode_steps_(spec.config["max_episode_steps"_]),
+        // ygopro-layout key max_steps (trainer-passed) wins when set; 0 falls
+        // back to the envpool-common max_episode_steps our tools use.
+        max_episode_steps_(int(spec.config["max_steps"_]) > 0
+                               ? int(spec.config["max_steps"_])
+                               : int(spec.config["max_episode_steps"_])),
         elapsed_step_(max_episode_steps_ + 1), dist_int_(0, 0xffffffff),
         deck1_(spec.config["deck1"_]), deck2_(spec.config["deck2"_]),
         puzzle_path_(spec.config["puzzle"_]),
@@ -2101,12 +2114,19 @@ public:
 private:
   using SpecIndex = ankerl::unordered_dense::map<std::string, uint16_t>;
 
-  void _set_obs_cards(TArray<uint8_t> &f_cards, SpecIndex &spec2index,
-                      PlayerId to_play) {
+  // ygopro layout (D4): rows are contiguous across both players (no fixed
+  // per-player halves), and the per-location card counts are returned for
+  // global_ features 8..21. Defensive row clamp: a fully cycled 60-card deck
+  // plus tokens can exceed the row budget, and an OOB write here corrupts
+  // the obs arena silently.
+  std::vector<int> _set_obs_cards(TArray<uint8_t> &f_cards,
+                                  SpecIndex &spec2index, PlayerId to_play) {
+    std::vector<int> loc_n_cards;
+    const int max_rows = spec_.config["max_cards"_] * 2;
+    int offset = 0;
     for (auto pi = 0; pi < 2; pi++) {
       const PlayerId player = (to_play + pi) % 2;
       const bool opponent = pi == 1;
-      int offset = opponent ? spec_.config["max_cards"_] : 0;
       std::vector<std::pair<uint8_t, bool>> configs = {
           {LOCATION_DECK, true},   {LOCATION_HAND, true},
           {LOCATION_MZONE, false}, {LOCATION_SZONE, false},
@@ -2121,14 +2141,22 @@ private:
         }
         if (opponent && hidden_for_opponent) {
           auto n_cards = YGO_QueryFieldCount(pduel_, player, location);
+          loc_n_cards.push_back(n_cards);
           for (auto i = 0; i < n_cards; i++) {
+            if (offset >= max_rows) {
+              break;
+            }
             f_cards(offset, 2) = location2id.at(location);
             f_cards(offset, 4) = 1;
             offset++;
           }
         } else {
           std::vector<Card> cards = get_cards_in_location(player, location);
+          loc_n_cards.push_back(cards.size());
           for (int i = 0; i < cards.size(); ++i) {
+            if (offset >= max_rows) {
+              break;
+            }
             const auto &c = cards[i];
             auto spec = c.get_spec(opponent);
             bool hide = false;
@@ -2147,6 +2175,7 @@ private:
         }
       }
     }
+    return loc_n_cards;
   }
 
   void _set_obs_card_(TArray<uint8_t> &f_cards, int offset, const Card &c,
@@ -2177,6 +2206,13 @@ private:
     if (overlay) {
       f_cards(offset, 5) = position2id.at(POS_FACEUP);
       f_cards(offset, 6) = 1;
+    } else if (location == LOCATION_DECK || location == LOCATION_HAND ||
+               location == LOCATION_EXTRA) {
+      // ygopro-layout convention: hidden-pile cards only carry an explicit
+      // facedown marker; a visible hand card's position column stays 0.
+      if (hide || (c.position_ & POS_FACEDOWN)) {
+        f_cards(offset, 5) = position2id.at(POS_FACEDOWN);
+      }
     } else {
       f_cards(offset, 5) = position2id.at(c.position_);
     }
@@ -2185,22 +2221,27 @@ private:
       f_cards(offset, 8) = race2id.at(c.race_);
       f_cards(offset, 9) = c.level_;
       f_cards(offset, 10) = std::min(c.counter_, static_cast<uint32_t>(15));
+      f_cards(offset, 11) = static_cast<uint8_t>(
+          (c.status_ & (STATUS_DISABLED | STATUS_FORBIDDEN)) != 0);
       auto [atk1, atk2] = float_transform(c.attack_);
-      f_cards(offset, 11) = atk1;
-      f_cards(offset, 12) = atk2;
+      f_cards(offset, 12) = atk1;
+      f_cards(offset, 13) = atk2;
 
       auto [def1, def2] = float_transform(c.defense_);
-      f_cards(offset, 13) = def1;
-      f_cards(offset, 14) = def2;
+      f_cards(offset, 14) = def1;
+      f_cards(offset, 15) = def2;
 
       auto type_ids = type_to_ids(c.type_);
       for (int j = 0; j < type_ids.size(); ++j) {
-        f_cards(offset, 15 + j) = type_ids[j];
+        f_cards(offset, 16 + j) = type_ids[j];
       }
     }
   }
 
-  void _set_obs_global(TArray<uint8_t> &feat, PlayerId player) {
+  // ygopro layout (D4): 23 features — 8 scalars, then the 14 per-location
+  // card counts from _set_obs_cards, then the abnormal-termination flag [22].
+  void _set_obs_global(TArray<uint8_t> &feat, PlayerId player,
+                       const std::vector<int> &loc_n_cards) {
     uint8_t me = player;
     uint8_t op = 1 - player;
 
@@ -2212,10 +2253,14 @@ private:
     feat(2) = op_lp_1;
     feat(3) = op_lp_2;
 
-    feat(4) = std::min(turn_count_, 8);
+    feat(4) = std::min(turn_count_, 16);
     feat(5) = phase2id.at(current_phase_);
     feat(6) = (me == 0) ? 1 : 0;
     feat(7) = (me == tp_) ? 1 : 0;
+
+    for (int i = 0; i < loc_n_cards.size() && i < 14; i++) {
+      feat(8 + i) = static_cast<uint8_t>(std::min(loc_n_cards[i], 255));
+    }
   }
 
   void _set_obs_action_spec(TArray<uint8_t> &feat, int i, int j,
@@ -2616,14 +2661,16 @@ private:
 
     if (n_options == 0) {
       state["info:num_options"_] = 1;
-      state["obs:global_"_][8] = uint8_t(1);
+      // ygopro layout: global_[22] is the abnormal-termination flag.
+      state["obs:global_"_][22] = uint8_t(1);
       return;
     }
 
     SpecIndex spec2index;
-    _set_obs_cards(state["obs:cards_"_], spec2index, to_play_);
+    auto loc_n_cards =
+        _set_obs_cards(state["obs:cards_"_], spec2index, to_play_);
 
-    _set_obs_global(state["obs:global_"_], to_play_);
+    _set_obs_global(state["obs:global_"_], to_play_, loc_n_cards);
 
     // we can't shuffle because idx must be stable in callback
     if (n_options > max_options()) {
@@ -3002,6 +3049,7 @@ private:
     uint32_t link = 0;
     uint32_t link_marker = 0;
     uint32_t counter = 0;
+    uint32_t status = 0;
     std::vector<CardCode> overlay_codes;
   };
 
@@ -3079,6 +3127,9 @@ private:
         }
         break;
       }
+      case QUERY_STATUS:
+        r.status = q_at_u32(payload);
+        break;
       default:
         break;
       }
@@ -3117,6 +3168,7 @@ private:
       c.defense_ = r.link_marker;
     }
     c.counter_ = r.counter;
+    c.status_ = r.status;
     return c;
   }
 
@@ -3149,8 +3201,8 @@ private:
   std::vector<Card> get_cards_in_location(PlayerId player, uint8_t loc) {
     int32_t flags = QUERY_CODE | QUERY_POSITION | QUERY_LEVEL | QUERY_RANK |
                     QUERY_ATTACK | QUERY_DEFENSE | QUERY_EQUIP_CARD |
-                    QUERY_OVERLAY_CARD | QUERY_COUNTERS | QUERY_LSCALE |
-                    QUERY_RSCALE | QUERY_LINK;
+                    QUERY_OVERLAY_CARD | QUERY_COUNTERS | QUERY_STATUS |
+                    QUERY_LSCALE | QUERY_RSCALE | QUERY_LINK;
     int32_t bl = OCG_QueryFieldCard(pduel_, player, loc, flags, query_buf_, 0);
     if (std::getenv("YGOENV_QUERY_DEBUG")) {
       fmt::print(stderr, "[qdbg] player={} loc={} bl={} bytes:", player, loc, bl);
