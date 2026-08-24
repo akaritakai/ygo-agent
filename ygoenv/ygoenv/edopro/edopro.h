@@ -1552,7 +1552,9 @@ public:
                     // Forcing the duel seed makes an incident exactly
                     // reproducible: (deck1, deck2, duel_seed, actions) is a
                     // complete case file for judge-style investigation.
-                    "duel_seed"_.Bind(0),
+                    // uint32: duel seeds span the full 32-bit range, and an int32
+                    // binding silently rejects any seed above 2^31.
+                    "duel_seed"_.Bind(uint32_t(0)),
                     // EDOPro single-mode puzzle: a Lua script that builds the
                     // board with Debug.AddCard/SetPlayerInfo/ReloadFieldEnd.
                     // When set, it replaces deck loading, giving small
@@ -1851,7 +1853,7 @@ public:
 
     if (record_) {
       if (is_recording && fp_ != nullptr) {
-        fclose(fp_);
+        close_replay();
       }
       auto time_str = time_now();
       // Use last 4 digits of seed as unique id
@@ -2032,9 +2034,8 @@ public:
         elapsed_step_ >= max_episode_steps_) {
       done_ = true;
       winner_ = 255;  // no winner: truncation draw
-      if (record_ && is_recording && fp_ != nullptr) {
-        fclose(fp_);
-        is_recording = false;
+      if (record_) {
+        close_replay();
       }
     }
 
@@ -2070,8 +2071,7 @@ public:
         if (!is_recording || fp_ == nullptr) {
           throw std::runtime_error("Recording is not started");
         }
-        fclose(fp_);
-        is_recording = false;
+        close_replay();
       }
     }
 
@@ -2665,6 +2665,26 @@ private:
 
   int prev_msg_for_retry_ = 0;
   std::string prev_option_for_retry_;
+
+  // Finalise a replay: YRP1's header carries the payload size, and EDOPro
+  // uses it to read the body. The writer never set it, producing files with
+  // size=0 that the client cannot load.
+  void close_replay() {
+    if (fp_ == nullptr) {
+      is_recording = false;
+      return;
+    }
+    long end = ftell(fp_);
+    long payload = end - static_cast<long>(sizeof(ExtendedReplayHeader));
+    if (payload > 0) {
+      uint32_t sz = static_cast<uint32_t>(payload);
+      fseek(fp_, offsetof(ReplayHeader, size), SEEK_SET);
+      fwrite(&sz, sizeof(sz), 1, fp_);
+    }
+    fclose(fp_);
+    fp_ = nullptr;
+    is_recording = false;
+  }
 
   void report_loop_incident(const char *cause) {
     if (std::getenv("YGOENV_NO_INCIDENTS")) {
