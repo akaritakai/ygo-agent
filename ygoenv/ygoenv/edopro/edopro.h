@@ -1039,6 +1039,11 @@ inline OCG_CardData db_query_card_data(
   return card;
 }
 
+// Identifies the binary that produced an incident: an action-index list only
+// replays faithfully against the build that recorded it, because engine
+// behaviour changes which options are offered.
+#define YGOENV_BUILD_ID (__DATE__ " " __TIME__)
+
 struct card_script {
   const char *buf;
   int len;
@@ -1555,6 +1560,10 @@ public:
                     // uint32: duel seeds span the full 32-bit range, and an int32
                     // binding silently rejects any seed above 2^31.
                     "duel_seed"_.Bind(uint32_t(0)),
+                    // Exact post-shuffle deck order. The deck is shuffled with
+                    // the env's own RNG, so duel_seed alone does NOT reproduce
+                    // a duel; an incident must carry the drawn order too.
+                    "deck_order_file"_.Bind(std::string("")),
                     // EDOPro single-mode puzzle: a Lua script that builds the
                     // board with Debug.AddCard/SetPlayerInfo/ReloadFieldEnd.
                     // When set, it replaces deck loading, giving small
@@ -1620,6 +1629,7 @@ constexpr uint64_t duel_options_ = DUEL_MODE_MR5;
 class EDOProEnv : public Env<EDOProEnvSpec> {
 protected:
   std::string puzzle_path_;
+  std::string deck_order_file_;
   std::string deck1_;
   std::string deck2_;
   std::vector<uint32_t> main_deck0_;
@@ -1731,6 +1741,7 @@ public:
         elapsed_step_(max_episode_steps_ + 1), dist_int_(0, 0xffffffff),
         deck1_(spec.config["deck1"_]), deck2_(spec.config["deck2"_]),
         puzzle_path_(spec.config["puzzle"_]),
+        deck_order_file_(spec.config["deck_order_file"_]),
         player_(spec.config["player"_]),
         play_modes_(parse_play_modes(spec.config["play_mode"_])),
         verbose_(spec.config["verbose"_]), record_(spec.config["record"_]),
@@ -2690,6 +2701,14 @@ private:
     if (std::getenv("YGOENV_NO_INCIDENTS")) {
       return;
     }
+    auto join = [](const std::vector<CardCode> &v) {
+      std::string out;
+      for (size_t i = 0; i < v.size(); ++i) {
+        if (i) out += ",";
+        out += std::to_string(v[i]);
+      }
+      return out;
+    };
     std::string acts;
     acts.reserve(action_history_.size() * 4);
     for (size_t i = 0; i < action_history_.size(); ++i) {
@@ -2697,11 +2716,17 @@ private:
       acts += std::to_string(action_history_[i]);
     }
     fmt::print(stderr,
-               "[incident] {{\"cause\":\"{}\",\"deck1\":\"{}\",\"deck2\":\"{}\","
+               "[incident] {{\"cause\":\"{}\",\"build\":\"{}\","
+               "\"deck1\":\"{}\",\"deck2\":\"{}\","
                "\"duel_seed\":{},\"turn\":{},\"last_chain_code\":{},"
-               "\"chains_since_decision\":{},\"actions\":[{}]}}\n",
-               cause, deck_name_[0], deck_name_[1], duel_seed_, turn_count_,
-               loop_cause_code_, chains_since_decision_, acts);
+               "\"chains_since_decision\":{},\"actions\":[{}],"
+               "\"main0\":\"{}\",\"extra0\":\"{}\","
+               "\"main1\":\"{}\",\"extra1\":\"{}\"}}\n",
+               cause, YGOENV_BUILD_ID, deck_name_[0], deck_name_[1], duel_seed_,
+               turn_count_,
+               loop_cause_code_, chains_since_decision_, acts,
+               join(main_deck0_), join(extra_deck0_),
+               join(main_deck1_), join(extra_deck1_));
   }
 
   void show_decision(int idx) {
@@ -2733,7 +2758,33 @@ private:
         deck, main_deck.size(), extra_deck.size());
     }
 
-    if (shuffle) {
+    if (!deck_order_file_.empty()) {
+      // Exact reproduction: use the recorded post-shuffle order.
+      std::ifstream df(deck_order_file_);
+      std::string line;
+      std::string want_main = fmt::format("main{}:", (int)player);
+      std::string want_extra = fmt::format("extra{}:", (int)player);
+      while (std::getline(df, line)) {
+        std::vector<CardCode> *dst = nullptr;
+        if (line.rfind(want_main, 0) == 0) {
+          dst = &main_deck;
+        } else if (line.rfind(want_extra, 0) == 0) {
+          dst = &extra_deck;
+        } else {
+          continue;
+        }
+        dst->clear();
+        std::string nums = line.substr(line.find(':') + 1);
+        size_t pos = 0;
+        while (pos < nums.size()) {
+          size_t comma = nums.find(',', pos);
+          if (comma == std::string::npos) comma = nums.size();
+          std::string tok = nums.substr(pos, comma - pos);
+          if (!tok.empty()) dst->push_back(std::stoul(tok));
+          pos = comma + 1;
+        }
+      }
+    } else if (shuffle) {
       std::shuffle(main_deck.begin(), main_deck.end(), gen_);
     }
 
