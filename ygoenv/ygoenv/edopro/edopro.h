@@ -945,6 +945,11 @@ public:
   ActionPlace place_ = ActionPlace::None;
   uint8_t attribute_ = 0;
 
+  // No column exists for an announced race in the upstream 12-feature
+  // layout (upstream never handled MSG_ANNOUNCE_RACE); the obs writer maps
+  // race_ through the number column, keyed by the msg column.
+  uint64_t race_ = 0;
+
   int spec_index_ = 0;
   CardId cid_ = 0;
   int msg_ = 0;
@@ -5701,7 +5706,9 @@ private:
       }
       for (int i = 0; i < 64; ++i) {
         if (available & (1ULL << i)) {
-          options_.push_back(std::string(1, static_cast<char>('0' + i)));
+          LegalAction la;
+          la.race_ = 1ULL << i;
+          push_action(la, std::string(1, static_cast<char>('0' + i)));
         }
       }
       if (verbose_) {
@@ -5731,7 +5738,9 @@ private:
       }
       std::sort(candidates.begin(), candidates.end());
       for (const auto &code : candidates) {
-        options_.push_back(std::to_string(code));
+        LegalAction la;
+        la.cid_ = c_get_card_id_or_zero(code);
+        push_action(la, std::to_string(code));
       }
       if (verbose_) {
         players_[player]->notify("Declare a card, " +
