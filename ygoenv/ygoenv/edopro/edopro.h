@@ -717,6 +717,54 @@ static const ankerl::unordered_dense::map<std::string, uint8_t> cmd_place2id =
                   "os3", "os4", "os5", "os6", "os7", "os8"}),
              1);
 
+using PlayerId = uint8_t;
+using CardCode = uint32_t;
+using CardId = uint16_t;
+
+// --- effect-description decoding for the typed action layer (D4 Stage B) ---
+// The modern core packs a card-effect description as (code << 20) | strindex;
+// values below 1<<20 are system-string ids. LegalAction.effect_ stores system
+// ids as-is and card-effect indices offset by kCardEffectOffset; the obs
+// writer compresses both into one uint8 column.
+constexpr uint32_t kSystemStringLimit = 1u << 20;
+constexpr int kCardEffectOffset = 1 << 20;
+
+inline std::tuple<CardCode, int> unpack_desc(uint64_t desc) {
+  if (desc < kSystemStringLimit) {
+    return {0, static_cast<int>(desc)};
+  }
+  CardCode code = static_cast<CardCode>(desc >> 20);
+  int idx = static_cast<int>(desc & 0xfffff);
+  return {code, idx + kCardEffectOffset};
+}
+
+// Stable ids (16+) for the curated system strings; unknown system strings map
+// to 255 instead of throwing — the modern core has far more system strings
+// than the curated map, and an obs id must never abort a duel.
+inline const ankerl::unordered_dense::map<int, uint8_t> &system_string2id() {
+  static const auto m = [] {
+    ankerl::unordered_dense::map<int, uint8_t> m2;
+    std::vector<int> keys;
+    keys.reserve(system_strings.size());
+    for (const auto &[k, v] : system_strings) {
+      keys.push_back(k);
+    }
+    std::sort(keys.begin(), keys.end());
+    uint8_t id = 16;
+    for (int k : keys) {
+      m2[k] = id++;
+    }
+    return m2;
+  }();
+  return m;
+}
+
+inline uint8_t system_string_to_id(int s) {
+  const auto &m = system_string2id();
+  auto it = m.find(s);
+  return it != m.end() ? it->second : uint8_t(255);
+}
+
 inline std::string phase_to_string(int phase) {
   auto it = phase2str.find(phase);
   if (it != phase2str.end()) {
@@ -807,9 +855,6 @@ struct ExtendedReplayHeader
 
 // end from Multirole/YGOPro/Replay.cpp
 
-using PlayerId = uint8_t;
-using CardCode = uint32_t;
-using CardId = uint16_t;
 
 struct loc_info {
 	uint8_t controler;
@@ -817,6 +862,165 @@ struct loc_info {
 	uint32_t sequence;
 	uint32_t position;
 };
+
+// --- typed action layer (D4 Stage B; mirrors ygopro.h so the upstream
+// agents' 12-feature action encoding can be produced). During migration a
+// LegalAction may instead carry the legacy option string in raw_; when every
+// handler is ported, raw_ goes away.
+
+enum class ActionAct {
+  None,
+  Set,
+  Repo,
+  SpSummon,
+  Summon,
+  MSet,
+  Attack,
+  DirectAttack,
+  Activate,
+  Cancel,
+};
+
+enum class ActionPhase {
+  None,
+  Battle,
+  Main2,
+  End,
+};
+
+enum class ActionPlace {
+  None,
+  MZone1, MZone2, MZone3, MZone4, MZone5, MZone6, MZone7,
+  SZone1, SZone2, SZone3, SZone4, SZone5, SZone6, SZone7, SZone8,
+  OpMZone1, OpMZone2, OpMZone3, OpMZone4, OpMZone5, OpMZone6, OpMZone7,
+  OpSZone1, OpSZone2, OpSZone3, OpSZone4, OpSZone5, OpSZone6, OpSZone7,
+  OpSZone8,
+};
+
+inline std::vector<ActionPlace> flag_to_usable_places(uint32_t flag,
+                                                      bool reverse = false) {
+  std::vector<ActionPlace> places;
+  for (int j = 0; j < 4; j++) {
+    uint32_t value = (flag >> (j * 8)) & 0xff;
+    for (int i = 0; i < 8; i++) {
+      bool avail = (value & (1 << i)) == 0;
+      if (reverse) {
+        avail = !avail;
+      }
+      if (avail) {
+        ActionPlace place;
+        if (j == 0) {
+          place = static_cast<ActionPlace>(
+              i + static_cast<int>(ActionPlace::MZone1));
+        } else if (j == 1) {
+          place = static_cast<ActionPlace>(
+              i + static_cast<int>(ActionPlace::SZone1));
+        } else if (j == 2) {
+          place = static_cast<ActionPlace>(
+              i + static_cast<int>(ActionPlace::OpMZone1));
+        } else {
+          place = static_cast<ActionPlace>(
+              i + static_cast<int>(ActionPlace::OpSZone1));
+        }
+        places.push_back(place);
+      }
+    }
+  }
+  return places;
+}
+
+class LegalAction {
+public:
+  // Migration only: the legacy option string for handlers not yet emitting
+  // typed fields. options_ is rendered from raw_ when non-empty.
+  std::string raw_ = "";
+
+  std::string spec_ = "";
+  ActionAct act_ = ActionAct::None;
+  ActionPhase phase_ = ActionPhase::None;
+  bool finish_ = false;
+  uint8_t position_ = 0;
+  int effect_ = -1;
+  uint8_t number_ = 0;
+  ActionPlace place_ = ActionPlace::None;
+  uint8_t attribute_ = 0;
+
+  int spec_index_ = 0;
+  CardId cid_ = 0;
+  int msg_ = 0;
+  uint32_t response_ = 0;
+
+  static LegalAction legacy(const std::string &option) {
+    LegalAction la;
+    la.raw_ = option;
+    return la;
+  }
+
+  static LegalAction from_spec(const std::string &spec) {
+    LegalAction la;
+    la.spec_ = spec;
+    return la;
+  }
+
+  static LegalAction act_spec(ActionAct act, const std::string &spec) {
+    LegalAction la;
+    la.act_ = act;
+    la.spec_ = spec;
+    return la;
+  }
+
+  static LegalAction finish() {
+    LegalAction la;
+    la.finish_ = true;
+    return la;
+  }
+
+  static LegalAction cancel() {
+    LegalAction la;
+    la.act_ = ActionAct::Cancel;
+    return la;
+  }
+
+  static LegalAction activate_spec(int effect_idx, const std::string &spec) {
+    LegalAction la;
+    la.act_ = ActionAct::Activate;
+    la.effect_ = effect_idx;
+    la.spec_ = spec;
+    return la;
+  }
+
+  static LegalAction phase(ActionPhase phase) {
+    LegalAction la;
+    la.phase_ = phase;
+    return la;
+  }
+
+  static LegalAction number(uint8_t number) {
+    LegalAction la;
+    la.number_ = number;
+    return la;
+  }
+
+  static LegalAction place(ActionPlace place) {
+    LegalAction la;
+    la.place_ = place;
+    return la;
+  }
+
+  static LegalAction attribute(int attribute) {
+    LegalAction la;
+    la.attribute_ = static_cast<uint8_t>(attribute);
+    return la;
+  }
+};
+
+class SpecInfo {
+public:
+  uint16_t index;
+  CardId cid;
+};
+
+using SpecInfos = ankerl::unordered_dense::map<std::string, SpecInfo>;
 
 class Card {
   friend class EDOProEnv;
@@ -1063,6 +1267,19 @@ static std::vector<std::string> deck_names_;
 inline const Card &c_get_card(CardCode code) { return cards_.at(code); }
 
 inline CardId &c_get_card_id(CardCode code) { return card_ids_.at(code); }
+
+// Non-throwing variants for codes decoded out of effect descriptions: a desc
+// can name a code outside the registered pool (tokens, alt arts), and an obs
+// annotation must never abort a duel.
+inline CardId c_get_card_id_or_zero(CardCode code) {
+  auto it = card_ids_.find(code);
+  return it != card_ids_.end() ? it->second : CardId(0);
+}
+
+inline const Card *c_find_card(CardCode code) {
+  auto it = cards_.find(code);
+  return it != cards_.end() ? &it->second : nullptr;
+}
 
 #ifndef CARD_MARINE_DOLPHIN
 #define CARD_MARINE_DOLPHIN 78734254
@@ -1697,6 +1914,10 @@ protected:
 
   int msg_;
   std::vector<std::string> options_;
+  // Typed twin of options_ (D4 Stage B). Ported handlers call push_action(),
+  // which keeps both in lockstep; when every handler is ported, options_
+  // becomes a pure render of this vector.
+  std::vector<LegalAction> legal_actions_;
   PlayerId to_play_;
   std::function<void(int)> callback_;
 
@@ -1710,7 +1931,9 @@ protected:
 
   uint8_t resp_buf_[128];
 
-  using IdleCardSpec = std::tuple<CardCode, std::string, uint32_t>;
+  // data is the effect description: u64 in the modern core
+  // ((code << 20) | strindex overflows u32 for almost every card code).
+  using IdleCardSpec = std::tuple<CardCode, std::string, uint64_t>;
 
   // chain
   PlayerId chaining_player_;
@@ -2963,6 +3186,7 @@ private:
     }
     done_ = true;
     options_.clear();
+    legal_actions_.clear();
   }
 
   uint8_t read_u8() { return data_[dp_++]; }
@@ -3274,7 +3498,7 @@ private:
       } else {
         seq = read_u8();
       }
-      uint32_t data = -1;
+      uint64_t data = -1;
       if (extra) {
         data = compat_read<uint32_t, uint64_t>();
         if (!compat_mode_) {
@@ -3315,6 +3539,17 @@ private:
     return card.name_ + " (" + spec + ")";
   }
 
+  // D4 Stage B migration: a ported handler emits its typed LegalAction and
+  // the exact option string it produced before, keeping options_ (the
+  // transcript/puzzle/golden surface) byte-stable while legal_actions_ grows
+  // handler by handler. When all handlers are ported, options_ becomes a
+  // render of legal_actions_ and the string argument goes away.
+  void push_action(LegalAction la, const std::string &option) {
+    la.msg_ = msg_;
+    options_.push_back(option);
+    legal_actions_.push_back(std::move(la));
+  }
+
   void handle_message() {
     int l_ = read_u32();
     dl_ = dp_ + l_;
@@ -3324,6 +3559,7 @@ private:
     }
     msg_ = int(data_[dp_++]);
     options_ = {};
+    legal_actions_.clear();
 
     if (verbose_) {
       fmt::println("Message {}, full {}, length {}, dp {}", msg_to_string(msg_), fdl_, dl_, dp_);
@@ -4227,7 +4463,10 @@ private:
         pl->notify("Battle menu:");
       }
       for (const auto [code, spec, data] : activatable) {
-        options_.push_back("v " + spec);
+        auto [code_d, eff_idx] = unpack_desc(data);
+        auto la = LegalAction::activate_spec(eff_idx, spec);
+        la.cid_ = c_get_card_id_or_zero(code_d != 0 ? code_d : code);
+        push_action(la, "v " + spec);
         if (verbose_) {
           auto [loc, seq, pos] = spec_to_ls(spec);
           auto c = get_card(player, loc, seq);
@@ -4237,7 +4476,9 @@ private:
         }
       }
       for (const auto [code, spec, data] : attackable) {
-        options_.push_back("a " + spec);
+        auto la = LegalAction::act_spec(ActionAct::Attack, spec);
+        la.cid_ = c_get_card_id_or_zero(code);
+        push_action(la, "a " + spec);
         if (verbose_) {
           auto [loc, seq, pos] = spec_to_ls(spec);
           auto c = get_card(player, loc, seq);
@@ -4252,14 +4493,14 @@ private:
         }
       }
       if (to_m2) {
-        options_.push_back("m");
+        push_action(LegalAction::phase(ActionPhase::Main2), "m");
         if (verbose_) {
           pl->notify("m: Main phase 2.");
         }
       }
       if (to_ep) {
         if (!to_m2) {
-          options_.push_back("e");
+          push_action(LegalAction::phase(ActionPhase::End), "e");
           if (verbose_) {
             pl->notify("e: End phase.");
           }
@@ -4847,7 +5088,9 @@ private:
       // auto other_timing = read_u32();
 
       std::vector<Card> cards;
-      std::vector<uint32_t> descs;
+      // u64: the modern core packs (code << 20) | strindex, which a u32
+      // truncates for almost every card code.
+      std::vector<uint64_t> descs;
       std::vector<uint32_t> spec_codes;
       for (int i = 0; i < size; ++i) {
         uint8_t flag;
@@ -4865,7 +5108,7 @@ private:
           spec_codes.push_back(
             ls_to_spec_code(loc_info, player));
         }
-        uint32_t desc = compat_read<uint32_t, uint64_t>();
+        uint64_t desc = compat_read<uint32_t, uint64_t>();
         descs.push_back(desc);
         if (!compat_mode_) {
           flag = read_u8();
@@ -4932,11 +5175,19 @@ private:
         }
       }
 
-      for (const auto &spec : chain_specs) {
-        options_.push_back(spec);
+      for (int i = 0; i < size; i++) {
+        auto [code_d, eff_idx] = unpack_desc(descs[i]);
+        // spec_ carries the bare spec (the option string keeps edopro's
+        // duplicate-disambiguation letter); the effect index disambiguates
+        // in the typed encoding, as in ygopro.
+        auto la = LegalAction::activate_spec(eff_idx, code_to_spec(spec_codes[i]));
+        if (code_d != 0) {
+          la.cid_ = c_get_card_id_or_zero(code_d);
+        }
+        push_action(la, chain_specs[i]);
       }
       if (!forced) {
-        options_.push_back("c");
+        push_action(LegalAction::cancel(), "c");
       }
       to_play_ = player;
       callback_ = [this, forced](int idx) {
@@ -4950,30 +5201,34 @@ private:
     } else if (msg_ == MSG_SELECT_YESNO) {
       auto player = read_u8();
 
+      auto desc = compat_read<uint32_t, uint64_t>();
+      auto [code_d, eff_idx] = unpack_desc(desc);
       if (verbose_) {
-        auto desc = compat_read<uint32_t, uint64_t>();
         auto pl = players_[player];
         std::string opt;
-        // if (desc > 10000) {
-        //   auto code = desc >> 4;
-        //   auto card = c_get_card(code);
-        //   auto opt_idx = desc & 0xf;
-        //   if (opt_idx < card.strings_.size()) {
-        //     opt = card.strings_[opt_idx];
-        //   }
-        //   if (opt.empty()) {
-        //     opt = "Unknown question from " + card.name_ + ". Yes or no?";
-        //   }
-        // } else {
-        //   opt = get_system_string(desc);
-        // }
-        opt = "TODO: MSG_SELECT_YESNO desc";
+        const Card *card = code_d != 0 ? c_find_card(code_d) : nullptr;
+        if (card != nullptr) {
+          uint32_t opt_idx = eff_idx - kCardEffectOffset;
+          if (opt_idx < card->strings_.size()) {
+            opt = card->strings_[opt_idx];
+          }
+          if (opt.empty()) {
+            opt = "Unknown question from " + card->name_ + ". Yes or no?";
+          }
+        } else {
+          opt = get_system_string(static_cast<uint32_t>(desc));
+        }
         pl->notify(opt);
         pl->notify("Please enter y or n.");
-      } else {
-        compat_read<uint32_t, uint64_t>();
       }
-      options_ = {"y", "n"};
+      {
+        auto la = LegalAction::activate_spec(eff_idx, "");
+        if (code_d != 0) {
+          la.cid_ = c_get_card_id_or_zero(code_d);
+        }
+        push_action(la, "y");
+        push_action(LegalAction::cancel(), "n");
+      }
       to_play_ = player;
       callback_ = [this](int idx) {
         if (idx == 0) {
@@ -4988,12 +5243,14 @@ private:
       auto player = read_u8();
 
       std::string spec;
+      uint64_t desc_v = 0;
       if (verbose_) {
         CardCode code = read_u32();
         auto loc_info = read_loc_info();
         Card card = c_get_card(code);
         card.set_location(loc_info);
         auto desc = compat_read<uint32_t, uint64_t>();
+        desc_v = desc;
         auto pl = players_[player];
         spec = card.get_spec(player);
         auto name = card.name_;
@@ -5039,10 +5296,20 @@ private:
       } else {
         dp_ += 4;
         auto loc_info = read_loc_info();
-        compat_read<uint32_t, uint64_t>();
+        desc_v = compat_read<uint32_t, uint64_t>();
         spec = ls_to_spec(loc_info, player);
       }
-      options_ = {"y " + spec, "n " + spec};
+      {
+        auto [code_d, eff_idx] = unpack_desc(desc_v);
+        auto la = LegalAction::activate_spec(eff_idx, spec);
+        if (code_d != 0) {
+          la.cid_ = c_get_card_id_or_zero(code_d);
+        }
+        push_action(la, "y " + spec);
+        auto no = LegalAction::cancel();
+        no.spec_ = spec;
+        push_action(no, "n " + spec);
+      }
       to_play_ = player;
       callback_ = [this](int idx) {
         if (idx == 0) {
@@ -5056,27 +5323,33 @@ private:
     } else if (msg_ == MSG_SELECT_OPTION) {
       auto player = read_u8();
       auto size = read_u8();
-      if (verbose_) {
-        auto pl = players_[player];
-        pl->notify("Select an option:");
-        for (int i = 0; i < size; ++i) {
-          auto opt = compat_read<uint32_t, uint64_t>();
-          std::string s;
-          // if (opt > 10000) {
-          //   CardCode code = opt >> 4;
-          //   s = c_get_card(code).strings_[opt & 0xf];
-          // } else {
-          //   s = get_system_string(opt);
-          // }
-          s = "TODO: MSG_SELECT_OPTION desc";
-          std::string option = std::to_string(i + 1);
-          options_.push_back(option);
-          pl->notify(option + ": " + s);
+      for (int i = 0; i < size; ++i) {
+        auto opt = compat_read<uint32_t, uint64_t>();
+        auto [code_d, eff_idx] = unpack_desc(opt);
+        auto la = LegalAction::activate_spec(eff_idx, "");
+        if (code_d != 0) {
+          la.cid_ = c_get_card_id_or_zero(code_d);
         }
-      } else {
-        for (int i = 0; i < size; ++i) {
-          compat_read<uint32_t, uint64_t>();
-          options_.push_back(std::to_string(i + 1));
+        push_action(la, std::to_string(i + 1));
+        if (verbose_) {
+          auto pl = players_[player];
+          if (i == 0) {
+            pl->notify("Select an option:");
+          }
+          std::string s;
+          const Card *card = code_d != 0 ? c_find_card(code_d) : nullptr;
+          if (card != nullptr) {
+            uint32_t opt_idx = eff_idx - kCardEffectOffset;
+            if (opt_idx < card->strings_.size()) {
+              s = card->strings_[opt_idx];
+            }
+            if (s.empty()) {
+              s = "option of " + card->name_;
+            }
+          } else {
+            s = get_system_string(static_cast<uint32_t>(opt));
+          }
+          pl->notify(std::to_string(i + 1) + ": " + s);
         }
       }
       to_play_ = player;
@@ -5111,7 +5384,9 @@ private:
       }
       for (const auto &[code, spec, data] : summonable_) {
         std::string option = "s " + spec;
-        options_.push_back(option);
+        auto la = LegalAction::act_spec(ActionAct::Summon, spec);
+        la.cid_ = c_get_card_id_or_zero(code);
+        push_action(la, option);
         if (verbose_) {
           const auto &name = c_get_card(code).name_;
           pl->notify(option + ": Summon " + name +
@@ -5122,7 +5397,9 @@ private:
       int spsummon_offset = offset;
       for (const auto &[code, spec, data] : spsummon_) {
         std::string option = "c " + spec;
-        options_.push_back(option);
+        auto la = LegalAction::act_spec(ActionAct::SpSummon, spec);
+        la.cid_ = c_get_card_id_or_zero(code);
+        push_action(la, option);
         if (verbose_) {
           const auto &name = c_get_card(code).name_;
           pl->notify(option + ": Special summon " + name + ".");
@@ -5132,7 +5409,9 @@ private:
       int repos_offset = offset;
       for (const auto &[code, spec, data] : repos_) {
         std::string option = "r " + spec;
-        options_.push_back(option);
+        auto la = LegalAction::act_spec(ActionAct::Repo, spec);
+        la.cid_ = c_get_card_id_or_zero(code);
+        push_action(la, option);
         if (verbose_) {
           const auto &name = c_get_card(code).name_;
           pl->notify(option + ": Reposition " + name + ".");
@@ -5142,7 +5421,9 @@ private:
       int mset_offset = offset;
       for (const auto &[code, spec, data] : idle_mset_) {
         std::string option = "m " + spec;
-        options_.push_back(option);
+        auto la = LegalAction::act_spec(ActionAct::MSet, spec);
+        la.cid_ = c_get_card_id_or_zero(code);
+        push_action(la, option);
         if (verbose_) {
           const auto &name = c_get_card(code).name_;
           pl->notify(option + ": Summon " + name +
@@ -5153,7 +5434,9 @@ private:
       int set_offset = offset;
       for (const auto &[code, spec, data] : idle_set_) {
         std::string option = "t " + spec;
-        options_.push_back(option);
+        auto la = LegalAction::act_spec(ActionAct::Set, spec);
+        la.cid_ = c_get_card_id_or_zero(code);
+        push_action(la, option);
         if (verbose_) {
           const auto &name = c_get_card(code).name_;
           pl->notify(option + ": Set " + name + ".");
@@ -5173,7 +5456,12 @@ private:
         if (count > 1) {
           option.push_back('a' + activate_count[spec] - 1);
         }
-        options_.push_back(option);
+        {
+          auto [code_d, eff_idx] = unpack_desc(data);
+          auto la = LegalAction::activate_spec(eff_idx, spec);
+          la.cid_ = c_get_card_id_or_zero(code_d != 0 ? code_d : code);
+          push_action(la, option);
+        }
         if (verbose_) {
           pl->notify(option + ": " +
                      c_get_card(code).get_effect_description(data));
@@ -5182,7 +5470,7 @@ private:
 
       if (to_bp_) {
         std::string cmd = "b";
-        options_.push_back(cmd);
+        push_action(LegalAction::phase(ActionPhase::Battle), cmd);
         if (verbose_) {
           pl->notify(cmd + ": Enter the battle phase.");
         }
@@ -5190,7 +5478,7 @@ private:
       if (to_ep_) {
         if (!to_bp_) {
           std::string cmd = "e";
-          options_.push_back(cmd);
+          push_action(LegalAction::phase(ActionPhase::End), cmd);
           if (verbose_) {
             pl->notify(cmd + ": End phase.");
           }
@@ -5238,7 +5526,11 @@ private:
         count = 1;
       }
       auto flag = read_u32();
-      options_ = flag_to_usable_cardspecs(flag);
+      for (const auto &spec : flag_to_usable_cardspecs(flag)) {
+        auto la = LegalAction::place(
+            static_cast<ActionPlace>(cmd_place2id.at(spec)));
+        push_action(la, spec);
+      }
       if (verbose_) {
         std::string specs_str = options_[0];
         for (int i = 1; i < options_.size(); ++i) {
@@ -5274,7 +5566,11 @@ private:
         count = 1;
       }
       auto flag = read_u32();
-      options_ = flag_to_usable_cardspecs(flag);
+      for (const auto &spec : flag_to_usable_cardspecs(flag)) {
+        auto la = LegalAction::place(
+            static_cast<ActionPlace>(cmd_place2id.at(spec)));
+        push_action(la, spec);
+      }
       if (verbose_) {
         std::string specs_str = options_[0];
         for (int i = 1; i < options_.size(); ++i) {
@@ -5314,7 +5610,8 @@ private:
                                    " not implemented for announce number");
         }
         numbers.push_back(number);
-        options_.push_back(std::string(1, '0' + number));
+        push_action(LegalAction::number(static_cast<uint8_t>(number)),
+                    std::string(1, '0' + number));
       }
       if (std::getenv("YGOENV_QUERY_DEBUG")) {
         fmt::print(stderr, "[adbg] announce_number player={} count={} numbers={}\n",
@@ -5377,7 +5674,9 @@ private:
             option += " ";
           }
         }
-        options_.push_back(option);
+        // count == 1 is enforced above, so the typed action carries the one
+        // announced attribute bit.
+        push_action(LegalAction::attribute(1 << (attrs[comb[0]] - 1)), option);
       }
 
       to_play_ = player;
@@ -5461,7 +5760,12 @@ private:
                        POS_FACEUP_DEFENSE, POS_FACEDOWN_DEFENSE}) {
         if (valid_pos & pos) {
           positions.push_back(pos);
-          options_.push_back(std::to_string(i));
+          {
+            LegalAction la;
+            la.position_ = pos;
+            la.cid_ = c_get_card_id_or_zero(code);
+            push_action(la, std::to_string(i));
+          }
           if (verbose_) {
             auto pl = players_[player];
             pl->notify(fmt::format("{}: {}", i, position_to_string(pos)));
