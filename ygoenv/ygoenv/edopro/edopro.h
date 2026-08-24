@@ -1923,6 +1923,24 @@ protected:
   // which keeps both in lockstep; when every handler is ported, options_
   // becomes a pure render of this vector.
   std::vector<LegalAction> legal_actions_;
+
+  // Iterative multi-select state (D4 Stage B): SELECT_CARD/TRIBUTE/SUM pick
+  // ONE card per env step instead of enumerating combinations (which explode
+  // and forced random fallbacks that silently hid actions). ms_idx_ != -1
+  // while a selection sequence is in progress; next() then re-presents
+  // without consuming a new core message.
+  // mode 0: free choice among remaining specs, finish allowed at >= min.
+  // mode 1: constrained; ms_combs_ holds the valid (sorted) index combos and
+  //         each pick prefix-filters them, auto-finishing on a complete one.
+  int ms_idx_ = -1;
+  int ms_mode_ = 0;
+  int ms_min_ = 0;
+  int ms_max_ = 0;
+  std::vector<std::string> ms_specs_;
+  std::vector<std::vector<int>> ms_combs_;
+  std::vector<int> ms_r_idxs_;
+  ankerl::unordered_dense::map<std::string, int> ms_spec2idx_;
+  std::function<void(const std::vector<int> &)> ms_send_;
   PlayerId to_play_;
   std::function<void(int)> callback_;
 
@@ -2188,6 +2206,7 @@ public:
 
     done_ = false;
     elapsed_step_ = 0;
+    ms_idx_ = -1;
     WriteState(0.0);
 
     // double seconds = static_cast<double>(clock() - start) / CLOCKS_PER_SEC;
@@ -2697,6 +2716,9 @@ private:
       }
     } else if (msg_ == MSG_SELECT_CARD || msg_ == MSG_SELECT_TRIBUTE ||
                msg_ == MSG_SELECT_SUM) {
+      if (option == "f") {
+        return card_ids;
+      }
       size_t start = 0;
       while (start < option.size()) {
         size_t idx = option.find_first_of(" ", start);
@@ -3099,10 +3121,11 @@ private:
         duel_started_ = false;
         dp_ = 0;
         fdl_ = 0;
+        ms_idx_ = -1;
         return;
       }
 
-      if (dp_ == fdl_) {
+      if (dp_ == fdl_ && ms_idx_ == -1) {
         duel_status_ = YGO_Process(pduel_);
         fdl_ = YGO_GetMessage(pduel_, data_);
         if (fdl_ == 0) {
@@ -3118,13 +3141,19 @@ private:
             duel_started_ = false;
             dp_ = 0;
             fdl_ = 0;
+            ms_idx_ = -1;
             return;
           }
           continue;
         }
         dp_ = 0;
       }
-      while (dp_ != fdl_) {
+      while (dp_ != fdl_ || ms_idx_ != -1) {
+        if (ms_idx_ != -1) {
+          // Mid multi-select: present the next iteration of the selection
+          // sequence; no new core message is consumed.
+          ms_present();
+        } else {
         handle_message();
         // A handler may end the duel mid-buffer (loop-guard truncation,
         // MSG_RETRY abort, MSG_WIN). The remaining bytes belong to a duel
@@ -3165,6 +3194,7 @@ private:
                      chains_since_decision_);
         }
         chains_since_decision_ = 0;
+        }
         if ((play_mode_ == kSelfPlay) || (to_play_ == ai_player_)) {
           if (options_.size() == 1) {
             prev_msg_for_retry_ = msg_;
@@ -3542,6 +3572,94 @@ private:
       return position2str.at(card.position_) + "card (" + spec + ")";
     }
     return card.name_ + " (" + spec + ")";
+  }
+
+  void ms_present() {
+    options_.clear();
+    legal_actions_.clear();
+    if (ms_mode_ == 0) {
+      for (int j = 0; j < ms_specs_.size(); ++j) {
+        if (ms_spec2idx_.find(ms_specs_[j]) != ms_spec2idx_.end()) {
+          push_action(LegalAction::from_spec(ms_specs_[j]), ms_specs_[j]);
+        }
+      }
+      if (static_cast<int>(ms_r_idxs_.size()) >= ms_min_) {
+        push_action(LegalAction::finish(), "f");
+      }
+    } else {
+      std::set<int> firsts;
+      for (const auto &c : ms_combs_) {
+        firsts.insert(c[0]);
+      }
+      for (int i : firsts) {
+        push_action(LegalAction::from_spec(ms_specs_[i]), ms_specs_[i]);
+      }
+    }
+    callback_ = [this](int idx) { ms_callback(idx); };
+  }
+
+  void ms_finish() {
+    ms_idx_ = -1;
+    ms_send_(ms_r_idxs_);
+  }
+
+  void ms_callback(int idx) {
+    const auto &action = legal_actions_[idx];
+    if (action.finish_) {
+      ms_finish();
+      return;
+    }
+    auto it = ms_spec2idx_.find(action.spec_);
+    if (it == ms_spec2idx_.end()) {
+      throw std::runtime_error("multi-select spec not found: " + action.spec_);
+    }
+    int sel = it->second;
+    ms_r_idxs_.push_back(sel);
+    if (ms_mode_ == 0) {
+      ms_spec2idx_.erase(it);
+      if (static_cast<int>(ms_r_idxs_.size()) >= ms_max_) {
+        ms_finish();
+        return;
+      }
+    } else {
+      std::vector<std::vector<int>> remaining;
+      bool complete = false;
+      for (auto &c : ms_combs_) {
+        if (c[0] == sel) {
+          c.erase(c.begin());
+          if (c.empty()) {
+            complete = true;
+            break;
+          }
+          remaining.push_back(std::move(c));
+        }
+      }
+      if (complete) {
+        ms_finish();
+        return;
+      }
+      ms_combs_ = std::move(remaining);
+    }
+    ms_idx_++;
+  }
+
+  void init_multi_select(
+      int min, int max, const std::vector<std::string> &specs, int mode,
+      std::vector<std::vector<int>> combs,
+      std::function<void(const std::vector<int> &)> send) {
+    ms_idx_ = 0;
+    ms_mode_ = mode;
+    ms_min_ = min;
+    ms_max_ = max;
+    ms_specs_ = specs;
+    ms_combs_ = std::move(combs);
+    ms_r_idxs_.clear();
+    ms_spec2idx_.clear();
+    ms_send_ = std::move(send);
+    for (int j = 0; j < ms_specs_.size(); ++j) {
+      ms_spec2idx_[ms_specs_[j]] = j;
+    }
+    ms_present();
   }
 
   // D4 Stage B migration: a ported handler emits its typed LegalAction and
@@ -4574,11 +4692,11 @@ private:
       }
 
       for (int j = 0; j < select_specs.size(); ++j) {
-        options_.push_back(select_specs[j]);
+        push_action(LegalAction::from_spec(select_specs[j]), select_specs[j]);
       }
 
       if (finishable) {
-        options_.push_back("f");
+        push_action(LegalAction::finish(), "f");
       }
 
       // cancelable and finishable not needed
@@ -4645,115 +4763,50 @@ private:
         }
       }
 
-      if (min > spec_.config["max_multi_select"_]) {
-        if (discard_hand_) {
-          // random discard
-          std::vector<int> comb(size);
-          std::iota(comb.begin(), comb.end(), 0);
-          std::shuffle(comb.begin(), comb.end(), gen_);
-          if (compat_mode_) {
-            resp_buf_[0] = min;
-            for (int i = 0; i < min; ++i) {
-              resp_buf_[i + 1] = comb[i];
-            }
-            YGO_SetResponseb(pduel_, resp_buf_);
-          } else {
-            // modern core: [i32 type=2][u32 count][u8 indices...]
-            int32_t rtype = 2;
-            uint32_t rsize = min;
-            memcpy(resp_buf_, &rtype, 4);
-            memcpy(resp_buf_ + 4, &rsize, 4);
-            for (int i = 0; i < min; ++i) {
-              resp_buf_[8 + i] = static_cast<uint8_t>(comb[i]);
-            }
-            YGO_SetResponseb(pduel_, resp_buf_, 8 + min);
-          }
-          discard_hand_ = false;
-          return;
-        }
-
-        // Fallback for selections larger than the action space supports:
-        // pick min random cards (uniform legal choice), as with discards.
-        std::vector<int> comb(size);
-        std::iota(comb.begin(), comb.end(), 0);
-        std::shuffle(comb.begin(), comb.end(), gen_);
-        if (compat_mode_) {
-          resp_buf_[0] = min;
-          for (int i = 0; i < min; ++i) {
-            resp_buf_[i + 1] = comb[i];
-          }
-          YGO_SetResponseb(pduel_, resp_buf_);
-        } else {
-          int32_t rtype = 2;
-          uint32_t rsize = min;
-          memcpy(resp_buf_, &rtype, 4);
-          memcpy(resp_buf_ + 4, &rsize, 4);
-          for (int i = 0; i < min; ++i) {
-            resp_buf_[8 + i] = static_cast<uint8_t>(comb[i]);
-          }
-          YGO_SetResponseb(pduel_, resp_buf_, 8 + min);
-        }
-        return;
-      }
-
-      max = std::min(max, uint32_t(spec_.config["max_multi_select"_]));
-
-      std::vector<std::vector<int>> combs;
-      for (int i = min; i <= max; ++i) {
-        for (const auto &comb : combinations(size, i)) {
-          combs.push_back(comb);
-          std::string option = "";
-          for (int j = 0; j < i; ++j) {
-            option += specs[comb[j]];
-            if (j < i - 1) {
-              option += " ";
-            }
-          }
-          options_.push_back(option);
-        }
-      }
-
-      to_play_ = player;
-      if (compat_mode_) {
-        callback_ = [this, combs](int idx) {
-          const auto &comb = combs[idx];
+      // Iterative multi-select (D4 Stage B): the agent picks one card per
+      // env step and finishes at >= min, instead of choosing among
+      // enumerated combinations. This also retires the random fallback for
+      // min > max_multi_select, which silently hid legal choices.
+      discard_hand_ = false;
+      bool compat = compat_mode_;
+      auto send = [this, compat](const std::vector<int> &comb) {
+        if (compat) {
           resp_buf_[0] = comb.size();
           for (int i = 0; i < comb.size(); ++i) {
             resp_buf_[i + 1] = comb[i];
           }
           YGO_SetResponseb(pduel_, resp_buf_);
-        };
-      } else {
-        callback_ = [this, combs](int idx) {
-          const auto &comb = combs[idx];
-    			uint32_t maxseq = 0;
-          uint32_t size = comb.size();
-          for (auto &c : comb) {
-            maxseq = std::max(maxseq, static_cast<uint32_t>(c));
+          return;
+        }
+        uint32_t maxseq = 0;
+        uint32_t size = comb.size();
+        for (auto &c : comb) {
+          maxseq = std::max(maxseq, static_cast<uint32_t>(c));
+        }
+        auto ret = GetSuitableReturn(maxseq, size);
+        memcpy(resp_buf_, &ret, sizeof(ret));
+        if (ret == 3) {
+          // bitmap over all selectable indices: ceil((maxseq+1)/8) bytes
+          uint32_t nbytes = maxseq / 8 + 1;
+          memset(resp_buf_ + 4, 0, nbytes);
+          for (int i = 0; i < comb.size(); ++i) {
+            resp_buf_[4 + comb[i] / 8] |= (1 << (comb[i] % 8));
           }
-          auto ret = GetSuitableReturn(maxseq, size);
-          memcpy(resp_buf_, &ret, sizeof(ret));
-          if (ret == 3) {
-            // bitmap over all selectable indices: ceil((maxseq+1)/8) bytes
-            uint32_t nbytes = maxseq / 8 + 1;
-            memset(resp_buf_ + 4, 0, nbytes);
-            for (int i = 0; i < comb.size(); ++i) {
-              resp_buf_[4 + comb[i] / 8] |= (1 << (comb[i] % 8));
-            }
-            YGO_SetResponseb(pduel_, resp_buf_, 4 + nbytes);
-          } else if (ret == 2) {
-            memcpy(resp_buf_ + 4, &size, sizeof(size));
-            for (int i = 0; i < size; ++i) {
-              uint8_t v = comb[i];
-              memcpy(resp_buf_ + 8 + i, &v, sizeof(v));
-            }
-            YGO_SetResponseb(pduel_, resp_buf_, 8 + size);
-          } else {
-            auto err = fmt::format("Invalid return value: {}", ret);
-            throw std::runtime_error(err);
+          YGO_SetResponseb(pduel_, resp_buf_, 4 + nbytes);
+        } else if (ret == 2) {
+          memcpy(resp_buf_ + 4, &size, sizeof(size));
+          for (int i = 0; i < size; ++i) {
+            uint8_t v = comb[i];
+            memcpy(resp_buf_ + 8 + i, &v, sizeof(v));
           }
-        };
-      }
+          YGO_SetResponseb(pduel_, resp_buf_, 8 + size);
+        } else {
+          auto err = fmt::format("Invalid return value: {}", ret);
+          throw std::runtime_error(err);
+        }
+      };
+      to_play_ = player;
+      init_multi_select(min, max, specs, 0, {}, send);
     } else if (msg_ == MSG_SELECT_TRIBUTE) {
       auto player = read_u8();
       bool cancelable = read_u8();
@@ -4814,63 +4867,52 @@ private:
           fmt::format("min({}) != max({}), not implemented for select tribute", min, max));
       }
 
-      std::vector<std::vector<int>> combs;
-      if (has_weight) {
-        combs = combinations_with_weight(release_params, min);
-      } else {
-        combs = combinations(size, min);
-      }
-      for (const auto &comb : combs) {
-        std::string option = "";
-        for (int j = 0; j < min; ++j) {
-          option += specs[comb[j]];
-          if (j < int(min) - 1) {
-            option += " ";
-          }
-        }
-        options_.push_back(option);
-      }
-
-      to_play_ = player;
-      if (compat_mode_) {
-        callback_ = [this, combs](int idx) {
-          const auto &comb = combs[idx];
+      // Iterative multi-select (D4 Stage B). Unweighted tributes are a free
+      // choice of exactly `min` cards (mode 0); weighted ones (monsters that
+      // count as two tributes) keep the valid-combination filter (mode 1) —
+      // a capability upstream ygopro punts on entirely.
+      bool compat = compat_mode_;
+      auto send = [this, compat](const std::vector<int> &comb) {
+        if (compat) {
           resp_buf_[0] = comb.size();
           for (int i = 0; i < comb.size(); ++i) {
             resp_buf_[i + 1] = comb[i];
           }
           YGO_SetResponseb(pduel_, resp_buf_);
-        };
+          return;
+        }
+        uint32_t maxseq = 0;
+        uint32_t size = comb.size();
+        for (auto &c : comb) {
+          maxseq = std::max(maxseq, static_cast<uint32_t>(c));
+        }
+        auto ret = GetSuitableReturn(maxseq, size);
+        memcpy(resp_buf_, &ret, sizeof(ret));
+        if (ret == 3) {
+          uint32_t nbytes = maxseq / 8 + 1;
+          memset(resp_buf_ + 4, 0, nbytes);
+          for (int i = 0; i < comb.size(); ++i) {
+            resp_buf_[4 + comb[i] / 8] |= (1 << (comb[i] % 8));
+          }
+          YGO_SetResponseb(pduel_, resp_buf_, 4 + nbytes);
+        } else if (ret == 2) {
+          memcpy(resp_buf_ + 4, &size, sizeof(size));
+          for (int i = 0; i < size; ++i) {
+            uint8_t v = comb[i];
+            memcpy(resp_buf_ + 8 + i, &v, sizeof(v));
+          }
+          YGO_SetResponseb(pduel_, resp_buf_, 8 + size);
+        } else {
+          auto err = fmt::format("Invalid return value: {}", ret);
+          throw std::runtime_error(err);
+        }
+      };
+      to_play_ = player;
+      if (has_weight) {
+        init_multi_select(min, max, specs, 1,
+                          combinations_with_weight(release_params, min), send);
       } else {
-        callback_ = [this, combs](int idx) {
-          const auto &comb = combs[idx];
-    			uint32_t maxseq = 0;
-          uint32_t size = comb.size();
-          for (auto &c : comb) {
-            maxseq = std::max(maxseq, static_cast<uint32_t>(c));
-          }
-          auto ret = GetSuitableReturn(maxseq, size);
-          memcpy(resp_buf_, &ret, sizeof(ret));
-          if (ret == 3) {
-            // bitmap over all selectable indices: ceil((maxseq+1)/8) bytes
-            uint32_t nbytes = maxseq / 8 + 1;
-            memset(resp_buf_ + 4, 0, nbytes);
-            for (int i = 0; i < comb.size(); ++i) {
-              resp_buf_[4 + comb[i] / 8] |= (1 << (comb[i] % 8));
-            }
-            YGO_SetResponseb(pduel_, resp_buf_, 4 + nbytes);
-          } else if (ret == 2) {
-            memcpy(resp_buf_ + 4, &size, sizeof(size));
-            for (int i = 0; i < size; ++i) {
-              uint8_t v = comb[i];
-              memcpy(resp_buf_ + 8 + i, &v, sizeof(v));
-            }
-            YGO_SetResponseb(pduel_, resp_buf_, 8 + size);
-          } else {
-            auto err = fmt::format("Invalid return value: {}", ret);
-            throw std::runtime_error(err);
-          }
-        };
+        init_multi_select(min, max, specs, 0, {}, send);
       }
     } else if (msg_ == MSG_SELECT_SUM) {
       uint8_t mode;
@@ -5034,49 +5076,41 @@ private:
                    fmt::join(select_params, ","), combs.size());
       }
 
-      for (const auto &comb : combs) {
-        std::string option = "";
-        int size = comb.size();
-        for (int j = 0; j < size; ++j) {
-          option += select_specs[comb[j]];
-          if (j < size - 1) {
-            option += " ";
-          }
-        }
-        options_.push_back(option);
-      }
-
-      to_play_ = player;
-      if (compat_mode_) {
-        callback_ = [this, combs, must_select_size](int idx) {
-          const auto &comb = combs[idx];
-          resp_buf_[0] = must_select_size + comb.size();
-          for (int i = 0; i < must_select_size; ++i) {
+      // Iterative multi-select (D4 Stage B, mode 1): the sum solver's combs
+      // define validity; the agent picks one card per env step and the pick
+      // prefix-filters the remaining combs.
+      bool compat = compat_mode_;
+      uint32_t must_n = must_select_size;
+      auto send = [this, compat, must_n](const std::vector<int> &comb) {
+        if (compat) {
+          resp_buf_[0] = must_n + comb.size();
+          for (int i = 0; i < must_n; ++i) {
             resp_buf_[i + 1] = 0;
           }
           for (int i = 0; i < comb.size(); ++i) {
-            resp_buf_[i + must_select_size + 1] = comb[i];
+            resp_buf_[i + must_n + 1] = comb[i];
           }
           YGO_SetResponseb(pduel_, resp_buf_);
-        };
-      } else {
-        callback_ = [this, combs, must_select_size](int idx) {
-          int32_t ret = 3;
-          memcpy(resp_buf_, &ret, sizeof(ret));
-          const auto &comb = combs[idx];
-          uint32_t maxidx = 0;
-          for (int c : comb) {
-            maxidx = std::max(maxidx, static_cast<uint32_t>(c));
-          }
-          uint32_t nbytes = maxidx / 8 + 1;
-          memset(resp_buf_ + 4, 0, nbytes);
-          for (int i = 0; i < comb.size(); ++i) {
-            resp_buf_[4 + comb[i] / 8] |= (1 << (comb[i] % 8));
-          }
-          YGO_SetResponseb(pduel_, resp_buf_, 4 + nbytes);
-        };
+          return;
+        }
+        int32_t ret = 3;
+        memcpy(resp_buf_, &ret, sizeof(ret));
+        uint32_t maxidx = 0;
+        for (int c : comb) {
+          maxidx = std::max(maxidx, static_cast<uint32_t>(c));
+        }
+        uint32_t nbytes = maxidx / 8 + 1;
+        memset(resp_buf_ + 4, 0, nbytes);
+        for (int i = 0; i < comb.size(); ++i) {
+          resp_buf_[4 + comb[i] / 8] |= (1 << (comb[i] % 8));
+        }
+        YGO_SetResponseb(pduel_, resp_buf_, 4 + nbytes);
+      };
+      to_play_ = player;
+      if (combs.empty()) {
+        throw std::runtime_error("select_sum: no valid combination found");
       }
-
+      init_multi_select(1, select_size, select_specs, 1, combs, send);
     } else if (msg_ == MSG_SELECT_CHAIN) {
       auto player = read_u8();
       uint32_t size;
