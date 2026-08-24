@@ -1776,7 +1776,7 @@ public:
                     "play_mode"_.Bind(std::string("bot")),
                     "verbose"_.Bind(false), "max_options"_.Bind(16),
                     "max_cards"_.Bind(80), "n_history_actions"_.Bind(16),
-                    "max_multi_select"_.Bind(5), "record"_.Bind(false),
+                    "record"_.Bind(false),
                     // Forcing the duel seed makes an incident exactly
                     // reproducible: (deck1, deck2, duel_seed, actions) is a
                     // complete case file for judge-style investigation.
@@ -1803,18 +1803,23 @@ public:
   }
   template <typename Config>
   static decltype(auto) StateSpec(const Config &conf) {
-    int n_action_feats = 10 + conf["max_multi_select"_] * 2;
+    // ygopro layout (D4): 12 typed action features; history rows add
+    // turn-diff and phase columns.
+    int n_action_feats = 12;
     return MakeDict(
         "obs:cards_"_.Bind(Spec<uint8_t>({conf["max_cards"_] * 2, 41})),
         "obs:global_"_.Bind(Spec<uint8_t>({23})),
         "obs:actions_"_.Bind(
             Spec<uint8_t>({conf["max_options"_], n_action_feats})),
         "obs:h_actions_"_.Bind(
-            Spec<uint8_t>({conf["n_history_actions"_], n_action_feats})),
+            Spec<uint8_t>({conf["n_history_actions"_], n_action_feats + 2})),
+        "obs:mask_"_.Bind(Spec<uint8_t>({conf["max_cards"_] * 2, 14})),
         "info:num_options"_.Bind(Spec<int>({}, std::tuple<int, int>{0, conf["max_options"_] - 1})),
         "info:to_play"_.Bind(Spec<int>({}, std::tuple<int, int>{0, 1})),
         "info:is_selfplay"_.Bind(Spec<int>({}, std::tuple<int, int>{0, 1})),
-        "info:win_reason"_.Bind(Spec<int>({}, std::tuple<int, int>{-1, 1})));
+        "info:win_reason"_.Bind(Spec<int>({}, std::tuple<int, int>{-1, 1})),
+        "info:step_time"_.Bind(Spec<double>({2})),
+        "info:deck"_.Bind(Spec<int>({2})));
   }
   template <typename Config>
   static decltype(auto) ActionSpec(const Config &conf) {
@@ -1972,12 +1977,10 @@ protected:
   // circular buffer for history actions of player 0
   TArray<uint8_t> history_actions_0_;
   int ha_p_0_ = 0;
-  std::vector<std::vector<CardId>> h_card_ids_0_;
 
   // circular buffer for history actions of player 1
   TArray<uint8_t> history_actions_1_;
   int ha_p_1_ = 0;
-  std::vector<std::vector<CardId>> h_card_ids_1_;
 
   std::vector<std::string> revealed_;
 
@@ -2012,13 +2015,11 @@ public:
     }
 
     int max_options = spec.config["max_options"_];
-    int n_action_feats = spec.state_spec["obs:actions_"_].shape[1];
-    h_card_ids_0_.resize(max_options);
-    h_card_ids_1_.resize(max_options);
+    int n_h_action_feats = spec.state_spec["obs:h_actions_"_].shape[1];
     history_actions_0_ = TArray<uint8_t>(Array(
-        ShapeSpec(sizeof(uint8_t), {n_history_actions_, n_action_feats})));
+        ShapeSpec(sizeof(uint8_t), {n_history_actions_, n_h_action_feats})));
     history_actions_1_ = TArray<uint8_t>(Array(
-        ShapeSpec(sizeof(uint8_t), {n_history_actions_, n_action_feats})));
+        ShapeSpec(sizeof(uint8_t), {n_history_actions_, n_h_action_feats})));
   }
 
   ~EDOProEnv() {
@@ -2219,24 +2220,25 @@ public:
     // }
   }
 
-  void update_h_card_ids(PlayerId player, int idx) {
-    auto &h_card_ids = player == 0 ? h_card_ids_0_ : h_card_ids_1_;
-    h_card_ids[idx] = parse_card_ids(options_[idx], player);
-  }
-
-  void update_history_actions(PlayerId player, int idx) {
+  void update_history_actions(PlayerId player, const LegalAction &action) {
+    if (action.act_ == ActionAct::Cancel) {
+      return;
+    }
     auto &history_actions =
         player == 0 ? history_actions_0_ : history_actions_1_;
     auto &ha_p = player == 0 ? ha_p_0_ : ha_p_1_;
-    const auto &h_card_ids = player == 0 ? h_card_ids_0_ : h_card_ids_1_;
 
     ha_p--;
     if (ha_p < 0) {
       ha_p = n_history_actions_ - 1;
     }
     history_actions[ha_p].Zero();
-    _set_obs_action(history_actions, ha_p, msg_, options_[idx], {},
-                    h_card_ids[idx]);
+    _set_obs_action(history_actions, ha_p, action);
+    // Spec index is meaningless across states; cols 12/13 carry the turn
+    // (converted to turn-diff at WriteState) and phase.
+    history_actions[ha_p](0) = 0;
+    history_actions[ha_p](12) = static_cast<uint8_t>(std::min(turn_count_, 255));
+    history_actions[ha_p](13) = phase2id.at(current_phase_);
   }
 
   void show_deck(const std::vector<CardCode> &deck, const std::string &prefix) const {
@@ -2259,23 +2261,18 @@ public:
 
   void show_history_actions(PlayerId player) const {
     const auto &ha = player == 0 ? history_actions_0_ : history_actions_1_;
-    // print card ids of history actions
     for (int i = 0; i < n_history_actions_; ++i) {
-      fmt::print("history {}\n", i);
-      uint8_t msg_id = uint8_t(ha(i, _obs_action_feat_offset()));
-      int msg = _msgs[msg_id - 1];
-      fmt::print("msg: {},", msg_to_string(msg));
-      for (int j = 0; j < spec_.config["max_multi_select"_]; j++) {
-        auto v1 = static_cast<CardId>(ha(i, 2 * j));
-        auto v2 = static_cast<CardId>(ha(i, 2 * j + 1));
-        CardId card_id = (v1 << 8) + v2;
-        fmt::print(" {}", card_id);
+      uint8_t msg_id = uint8_t(ha(i, 3));
+      if (msg_id == 0) {
+        break;
       }
-      fmt::print(";");
-      for (int j = _obs_action_feat_offset() + 1; j < ha.Shape()[1]; j++) {
+      int msg = _msgs[msg_id - 1];
+      CardId cid = (CardId(uint8_t(ha(i, 1))) << 8) + uint8_t(ha(i, 2));
+      fmt::print("history {}: msg {}, cid {},", i, msg_to_string(msg), cid);
+      for (int j = 4; j < ha.Shape()[1]; j++) {
         fmt::print(" {}", uint8_t(ha(i, j)));
       }
-      fmt::print(stderr, "\n");
+      fmt::print("\n");
     }
   }
 
@@ -2286,8 +2283,12 @@ public:
     action_history_.push_back(idx);
     prev_msg_for_retry_ = msg_;
     prev_option_for_retry_ = idx < options_.size() ? options_[idx] : "?";
+    // Record before advancing: legal_actions_ still holds this decision's
+    // typed actions (spec_index_/cid_ filled by WriteState).
+    if (idx < legal_actions_.size()) {
+      update_history_actions(to_play_, legal_actions_[idx]);
+    }
     callback_(idx);
-    // update_history_actions(to_play_, idx);
 
     PlayerId player = to_play_;
 
@@ -2359,15 +2360,15 @@ public:
   }
 
 private:
-  using SpecIndex = ankerl::unordered_dense::map<std::string, uint16_t>;
 
   // ygopro layout (D4): rows are contiguous across both players (no fixed
   // per-player halves), and the per-location card counts are returned for
   // global_ features 8..21. Defensive row clamp: a fully cycled 60-card deck
   // plus tokens can exceed the row budget, and an OOB write here corrupts
   // the obs arena silently.
-  std::vector<int> _set_obs_cards(TArray<uint8_t> &f_cards,
-                                  SpecIndex &spec2index, PlayerId to_play) {
+  std::tuple<SpecInfos, std::vector<int>> _set_obs_cards(
+      TArray<uint8_t> &f_cards, PlayerId to_play) {
+    SpecInfos spec_infos;
     std::vector<int> loc_n_cards;
     const int max_rows = spec_.config["max_cards"_] * 2;
     int offset = 0;
@@ -2415,14 +2416,44 @@ private:
                 hide = false;
               }
             }
+            CardId card_id = 0;
+            if (!hide) {
+              card_id = c_get_card_id_or_zero(c.code_);
+            }
             _set_obs_card_(f_cards, offset, c, hide);
             offset++;
-            spec2index[spec] = static_cast<uint16_t>(offset);
+            spec_infos[spec] = {static_cast<uint16_t>(offset), card_id};
           }
         }
       }
     }
-    return loc_n_cards;
+    return {spec_infos, loc_n_cards};
+  }
+
+  static int deck_name_id(const std::string &name) {
+    for (int i = 0; i < deck_names_.size(); ++i) {
+      if (deck_names_[i] == name) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  const SpecInfo &find_spec_info(SpecInfos &spec_infos,
+                                 const std::string &spec) {
+    auto it = spec_infos.find(spec);
+    if (it == spec_infos.end()) {
+      if (std::getenv("YGOENV_QUERY_DEBUG")) {
+        fmt::println(stderr, "Spec not found: {}; spec_infos:", spec);
+        for (auto &[k, v] : spec_infos) {
+          fmt::print(stderr, "{}: {} {}, ", k, v.index, v.cid);
+        }
+        fmt::print(stderr, "\n");
+      }
+      spec_infos[spec] = {0, 0};
+      return spec_infos[spec];
+    }
+    return it->second;
   }
 
   void _set_obs_card_(TArray<uint8_t> &f_cards, int offset, const Card &c,
@@ -2510,181 +2541,117 @@ private:
     }
   }
 
-  void _set_obs_action_spec(TArray<uint8_t> &feat, int i, int j,
-                            const std::string &spec,
-                            const SpecIndex &spec2index,
-                            const std::vector<CardId> &card_ids) {
-    uint16_t idx;
-    if (spec2index.empty()) {
-      idx = card_ids[j];
-    } else {
-      auto it = spec2index.find(spec);
-      if (it == spec2index.end()) {
-        // TODO: find the root cause
-        if (std::getenv("YGOENV_QUERY_DEBUG")) {
-          fmt::println(stderr, "Spec not found: {}; spec2index:", spec);
-          for (auto &[k, v] : spec2index) {
-            fmt::println(stderr, "{}: {}", k, v);
-          }
-        }
-        // throw std::runtime_error("Spec not found: " + spec);
-        idx = 1;
-      } else {
-        idx = it->second;
-      }
-    }
-    feat(i, 2 * j) = static_cast<uint8_t>(idx >> 8);
-    feat(i, 2 * j + 1) = static_cast<uint8_t>(idx & 0xff);
+  // --- 12-column typed action writer (ygopro layout, D4 Stage B) ---
+  // 0 spec_index (row+1 into cards_) | 1-2 card id | 3 msg | 4 act |
+  // 5 finish | 6 effect | 7 phase | 8 position | 9 number (also announced
+  // race, keyed by msg) | 10 place | 11 attribute.
+  void _set_obs_action_spec_idx(TArray<uint8_t> &feat, int i, int idx) {
+    feat(i, 0) = static_cast<uint8_t>(std::min(idx, 255));
   }
 
-  int _obs_action_feat_offset() const {
-    return spec_.config["max_multi_select"_] * 2;
+  void _set_obs_action_card_id(TArray<uint8_t> &feat, int i, CardId cid) {
+    feat(i, 1) = static_cast<uint8_t>(cid >> 8);
+    feat(i, 2) = static_cast<uint8_t>(cid & 0xff);
   }
 
   void _set_obs_action_msg(TArray<uint8_t> &feat, int i, int msg) {
-    feat(i, _obs_action_feat_offset()) = msg2id.at(msg);
+    feat(i, 3) = msg2id.at(msg);
   }
 
-  void _set_obs_action_act(TArray<uint8_t> &feat, int i, char act,
-                           uint8_t act_offset = 0) {
-    feat(i, _obs_action_feat_offset() + 1) = cmd_act2id.at(act) + act_offset;
+  void _set_obs_action_act(TArray<uint8_t> &feat, int i, ActionAct act) {
+    feat(i, 4) = static_cast<uint8_t>(act);
   }
 
-  void _set_obs_action_yesno(TArray<uint8_t> &feat, int i, char yesno) {
-    feat(i, _obs_action_feat_offset() + 2) = cmd_yesno2id.at(yesno);
+  void _set_obs_action_finish(TArray<uint8_t> &feat, int i) {
+    feat(i, 5) = 1;
   }
 
-  void _set_obs_action_phase(TArray<uint8_t> &feat, int i, char phase) {
-    feat(i, _obs_action_feat_offset() + 3) = cmd_phase2id.at(phase);
+  void _set_obs_action_effect(TArray<uint8_t> &feat, int i, int effect) {
+    // 0: none | 1: default | 2-15: card effect index (clamped; modern
+    // strindex can exceed 14) | 16+: curated system string, 255 unknown.
+    int e;
+    if (effect == -1) {
+      e = 0;
+    } else if (effect == 0) {
+      e = 1;
+    } else if (effect >= kCardEffectOffset) {
+      e = std::min(effect - kCardEffectOffset + 2, 15);
+    } else {
+      e = system_string_to_id(effect);
+    }
+    feat(i, 6) = static_cast<uint8_t>(e);
   }
 
-  void _set_obs_action_cancel_finish(TArray<uint8_t> &feat, int i, char c) {
-    uint8_t v = c == 'c' ? 1 : (c == 'f' ? 2 : 0);
-    feat(i, _obs_action_feat_offset() + 4) = v;
+  void _set_obs_action_phase(TArray<uint8_t> &feat, int i, ActionPhase phase) {
+    feat(i, 7) = static_cast<uint8_t>(phase);
   }
 
-  void _set_obs_action_position(TArray<uint8_t> &feat, int i, char position) {
-    position = 1 << (position - '1');
-    feat(i, _obs_action_feat_offset() + 5) = position2id.at(position);
+  void _set_obs_action_position(TArray<uint8_t> &feat, int i,
+                                uint8_t position) {
+    feat(i, 8) = position2id.at(position);
   }
 
-  void _set_obs_action_option(TArray<uint8_t> &feat, int i, char option) {
-    feat(i, _obs_action_feat_offset() + 6) = option - '0';
+  void _set_obs_action_number(TArray<uint8_t> &feat, int i, uint8_t number) {
+    feat(i, 9) = number;
   }
 
-  void _set_obs_action_number(TArray<uint8_t> &feat, int i, char number) {
-    feat(i, _obs_action_feat_offset() + 7) = number - '0';
-  }
-
-  void _set_obs_action_place(TArray<uint8_t> &feat, int i,
-                             const std::string &spec) {
-    feat(i, _obs_action_feat_offset() + 8) = cmd_place2id.at(spec);
+  void _set_obs_action_place(TArray<uint8_t> &feat, int i, ActionPlace place) {
+    feat(i, 10) = static_cast<uint8_t>(place);
   }
 
   void _set_obs_action_attrib(TArray<uint8_t> &feat, int i, uint8_t attrib) {
-    feat(i, _obs_action_feat_offset() + 9) = attribute2id.at(attrib);
+    feat(i, 11) = attribute2id.at(attrib);
   }
 
-  void _set_obs_action(TArray<uint8_t> &feat, int i, int msg,
-                       const std::string &option, const SpecIndex &spec2index,
-                       const std::vector<CardId> &card_ids) {
+  void _set_obs_action(TArray<uint8_t> &feat, int i,
+                       const LegalAction &action) {
+    auto msg = action.msg_;
     _set_obs_action_msg(feat, i, msg);
-    if (msg == MSG_SELECT_IDLECMD) {
-      if (option == "b" || option == "e") {
-        _set_obs_action_phase(feat, i, option[0]);
+    _set_obs_action_card_id(feat, i, action.cid_);
+    if (msg == MSG_SELECT_CARD || msg == MSG_SELECT_TRIBUTE ||
+        msg == MSG_SELECT_SUM || msg == MSG_SELECT_UNSELECT_CARD) {
+      if (action.finish_) {
+        _set_obs_action_finish(feat, i);
       } else {
-        auto act = option[0];
-        auto spec = option.substr(2);
-        uint8_t offset = 0;
-        int n = spec.size();
-        if (act == 'v' && std::isalpha(spec[n - 1])) {
-          offset = spec[n - 1] - 'a';
-          spec = spec.substr(0, n - 1);
-        }
-        _set_obs_action_act(feat, i, act, offset);
-
-        _set_obs_action_spec(feat, i, 0, spec, spec2index, card_ids);
-      }
-    } else if (msg == MSG_SELECT_CHAIN) {
-      if (option[0] == 'c') {
-        _set_obs_action_cancel_finish(feat, i, option[0]);
-      } else {
-        char act = 'v';
-        auto spec = option;
-        uint8_t offset = 0;
-        auto n = spec.size();
-        if (std::isalpha(spec[n - 1])) {
-          offset = spec[n - 1] - 'a';
-          spec = spec.substr(0, n - 1);
-        }
-        _set_obs_action_act(feat, i, act, offset);
-
-        _set_obs_action_spec(feat, i, 0, spec, spec2index, card_ids);
-      }
-    } else if (msg == MSG_SELECT_CARD || msg == MSG_SELECT_TRIBUTE ||
-               msg == MSG_SELECT_SUM) {
-      if (spec2index.empty()) {
-        for (int k = 0; k < card_ids.size(); ++k) {
-          _set_obs_action_spec(feat, i, k, option, spec2index, card_ids);
-        }
-      } else {
-        int k = 0;
-        size_t start = 0;
-        while (start < option.size()) {
-          size_t idx = option.find_first_of(" ", start);
-          if (idx == std::string::npos) {
-            auto spec = option.substr(start);
-            _set_obs_action_spec(feat, i, k, spec, spec2index, {});
-            break;
-          } else {
-            auto spec = option.substr(start, idx - start);
-            _set_obs_action_spec(feat, i, k, spec, spec2index, {});
-            k++;
-            start = idx + 1;
-          }
-        }
-      }
-    } else if (msg == MSG_SELECT_UNSELECT_CARD) {
-      if (option[0] == 'f') {
-        _set_obs_action_cancel_finish(feat, i, option[0]);
-      } else {
-        _set_obs_action_spec(feat, i, 0, option, spec2index, card_ids);
+        _set_obs_action_spec_idx(feat, i, action.spec_index_);
       }
     } else if (msg == MSG_SELECT_POSITION) {
-      _set_obs_action_position(feat, i, option[0]);
+      _set_obs_action_position(feat, i, action.position_);
     } else if (msg == MSG_SELECT_EFFECTYN) {
-      auto spec = option.substr(2);
-      _set_obs_action_spec(feat, i, 0, spec, spec2index, card_ids);
-
-      _set_obs_action_yesno(feat, i, option[0]);
-    } else if (msg == MSG_SELECT_YESNO) {
-      _set_obs_action_yesno(feat, i, option[0]);
-    } else if (msg == MSG_SELECT_BATTLECMD) {
-      if (option == "m" || option == "e") {
-        _set_obs_action_phase(feat, i, option[0]);
-      } else {
-        auto act = option[0];
-        auto spec = option.substr(2);
-        _set_obs_action_act(feat, i, act);
-        _set_obs_action_spec(feat, i, 0, spec, spec2index, card_ids);
-      }
-    } else if (msg == MSG_SELECT_OPTION) {
-      _set_obs_action_option(feat, i, option[0]);
-    } else if (msg == MSG_SELECT_PLACE || msg_ == MSG_SELECT_DISFIELD) {
-      _set_obs_action_place(feat, i, option);
-    } else if (msg == MSG_ANNOUNCE_ATTRIB) {
-      _set_obs_action_attrib(feat, i, 1 << (option[0] - '1'));
-    } else if (msg == MSG_ANNOUNCE_NUMBER) {
-      _set_obs_action_number(feat, i, option[0]);
-    } else if (msg == MSG_ANNOUNCE_RACE) {
-      _set_obs_action_number(feat, i, option[0]);
+      _set_obs_action_spec_idx(feat, i, action.spec_index_);
+      _set_obs_action_act(feat, i, action.act_);
+      _set_obs_action_effect(feat, i, action.effect_);
+    } else if (msg == MSG_SELECT_YESNO || msg == MSG_SELECT_OPTION) {
+      _set_obs_action_act(feat, i, action.act_);
+      _set_obs_action_effect(feat, i, action.effect_);
+    } else if (msg == MSG_SELECT_BATTLECMD || msg == MSG_SELECT_IDLECMD ||
+               msg == MSG_SELECT_CHAIN) {
+      _set_obs_action_phase(feat, i, action.phase_);
+      _set_obs_action_spec_idx(feat, i, action.spec_index_);
+      _set_obs_action_act(feat, i, action.act_);
+      _set_obs_action_effect(feat, i, action.effect_);
+    } else if (msg == MSG_SELECT_PLACE || msg == MSG_SELECT_DISFIELD) {
+      _set_obs_action_place(feat, i, action.place_);
     } else if (msg == MSG_ANNOUNCE_CARD) {
-      // option is the declared card code; expose its card-id embedding index
-      CardId cid = c_get_card_id(std::stoul(option));
-      feat(i, 0) = static_cast<uint8_t>(cid >> 8);
-      feat(i, 1) = static_cast<uint8_t>(cid & 0xff);
+      // card id, already set
+    } else if (msg == MSG_ANNOUNCE_ATTRIB) {
+      _set_obs_action_attrib(feat, i, action.attribute_);
+    } else if (msg == MSG_ANNOUNCE_NUMBER) {
+      _set_obs_action_number(feat, i, action.number_);
+    } else if (msg == MSG_ANNOUNCE_RACE) {
+      // No dedicated column upstream; the race id rides the number column,
+      // keyed by the msg column.
+      auto it = race2id.find(static_cast<uint32_t>(action.race_));
+      _set_obs_action_number(feat, i, it != race2id.end() ? it->second : 0);
     } else {
-      throw std::runtime_error("Unsupported message " + std::to_string(msg));
+      throw std::runtime_error("Unsupported message " + msg_to_string(msg));
+    }
+  }
+
+  void _set_obs_actions(TArray<uint8_t> &feat,
+                        const std::vector<LegalAction> &actions) {
+    for (int i = 0; i < actions.size(); ++i) {
+      _set_obs_action(feat, i, actions[i]);
     }
   }
 
@@ -2697,61 +2664,6 @@ private:
     auto [loc, seq, pos] = spec_to_ls(spec.substr(offset));
     return card_ids_.at(get_card_code(player, loc, seq));
   }
-
-  std::vector<CardId> parse_card_ids(const std::string &option,
-                                     PlayerId player) {
-    std::vector<CardId> card_ids;
-    if (msg_ == MSG_SELECT_IDLECMD) {
-      if (!(option == "b" || option == "e")) {
-        auto n = option.size();
-        if (std::isalpha(option[n - 1])) {
-          card_ids.push_back(spec_to_card_id(option.substr(2, n - 3), player));
-        } else {
-          card_ids.push_back(spec_to_card_id(option.substr(2), player));
-        }
-      }
-    } else if (msg_ == MSG_SELECT_CHAIN) {
-      if (option != "c") {
-        card_ids.push_back(spec_to_card_id(option, player));
-      }
-    } else if (msg_ == MSG_SELECT_CARD || msg_ == MSG_SELECT_TRIBUTE ||
-               msg_ == MSG_SELECT_SUM) {
-      if (option == "f") {
-        return card_ids;
-      }
-      size_t start = 0;
-      while (start < option.size()) {
-        size_t idx = option.find_first_of(" ", start);
-        if (idx == std::string::npos) {
-          card_ids.push_back(spec_to_card_id(option.substr(start), player));
-          break;
-        } else {
-          card_ids.push_back(
-              spec_to_card_id(option.substr(start, idx - start), player));
-          start = idx + 1;
-        }
-      }
-    } else if (msg_ == MSG_SELECT_UNSELECT_CARD) {
-      if (option[0] != 'f') {
-        card_ids.push_back(spec_to_card_id(option, player));
-      }
-    } else if (msg_ == MSG_SELECT_EFFECTYN) {
-      card_ids.push_back(spec_to_card_id(option.substr(2), player));
-    } else if (msg_ == MSG_SELECT_BATTLECMD) {
-      if (!(option == "m" || option == "e")) {
-        card_ids.push_back(spec_to_card_id(option.substr(2), player));
-      }
-    }
-    return card_ids;
-  }
-
-  void _set_obs_actions(TArray<uint8_t> &feat, const SpecIndex &spec2index,
-                        int msg, const std::vector<std::string> &options) {
-    for (int i = 0; i < options.size(); ++i) {
-      _set_obs_action(feat, i, msg, options[i], spec2index, {});
-    }
-  }
-
 
   void str_to_uint16(const char* src, uint16_t* dest) {
       for (int i = 0; i < strlen(src); i += 1) {
@@ -2908,6 +2820,12 @@ private:
     state["info:to_play"_] = int(to_play_);
     state["info:is_selfplay"_] = int(play_mode_ == kSelfPlay);
     state["info:win_reason"_] = win_reason;
+    if (reward != 0.0) {
+      state["info:step_time"_][0] = 0;
+      state["info:step_time"_][1] = 0;
+      state["info:deck"_][0] = deck_name_id(deck_name_[0]);
+      state["info:deck"_][1] = deck_name_id(deck_name_[1]);
+    }
 
     if (n_options == 0) {
       state["info:num_options"_] = 1;
@@ -2916,59 +2834,63 @@ private:
       return;
     }
 
-    SpecIndex spec2index;
-    auto loc_n_cards =
-        _set_obs_cards(state["obs:cards_"_], spec2index, to_play_);
+    if (options_.size() != legal_actions_.size()) {
+      // Migration invariant: every handler emits typed actions in lockstep
+      // with its option strings. A mismatch means an unported emission path.
+      throw std::runtime_error(fmt::format(
+          "options/legal_actions mismatch at msg {}: {} vs {}",
+          msg_to_string(msg_), options_.size(), legal_actions_.size()));
+    }
+
+    auto [spec_infos, loc_n_cards] =
+        _set_obs_cards(state["obs:cards_"_], to_play_);
 
     _set_obs_global(state["obs:global_"_], to_play_, loc_n_cards);
 
     // we can't shuffle because idx must be stable in callback
     if (n_options > max_options()) {
       options_.resize(max_options());
+      legal_actions_.resize(max_options());
     }
-
-    // print spec2index
-    // for (auto const& [key, val] : spec2index) {
-    //   fmt::println("{} {}", key, val);
-    // }
-
-    _set_obs_actions(state["obs:actions_"_], spec2index, msg_, options_);
 
     n_options = options_.size();
     state["info:num_options"_] = n_options;
 
-    // update h_card_ids from state
-    auto &h_card_ids = to_play_ == 0 ? h_card_ids_0_ : h_card_ids_1_;
-
     for (int i = 0; i < n_options; ++i) {
-      std::vector<CardId> card_ids;
-      for (int j = 0; j < spec_.config["max_multi_select"_]; ++j) {
-        uint8_t spec_index = state["obs:actions_"_](i, 2 * j + 1);
-        if (spec_index == 0) {
-          break;
+      auto &action = legal_actions_[i];
+      action.msg_ = msg_;
+      const auto &spec = action.spec_;
+      if (!spec.empty()) {
+        const auto &spec_info = find_spec_info(spec_infos, spec);
+        action.spec_index_ = spec_info.index;
+        if (action.cid_ == 0) {
+          action.cid_ = spec_info.cid;
         }
-        // because of na_card_embed, we need to subtract 1
-        uint16_t card_id1 =
-            static_cast<uint16_t>(state["obs:cards_"_](spec_index - 1, 0));
-        uint16_t card_id2 =
-            static_cast<uint16_t>(state["obs:cards_"_](spec_index - 1, 1));
-        card_ids.push_back((card_id1 << 8) + card_id2);
       }
-      h_card_ids[i] = card_ids;
     }
 
-    // write history actions
+    _set_obs_actions(state["obs:actions_"_], legal_actions_);
 
+    // write history actions (newest first), then convert the stored turn
+    // number into a turn-diff relative to now
     const auto &ha_p = to_play_ == 0 ? ha_p_0_ : ha_p_1_;
     const auto &history_actions =
         to_play_ == 0 ? history_actions_0_ : history_actions_1_;
     int n1 = n_history_actions_ - ha_p;
-    int n_action_feats = state["obs:actions_"_].Shape()[1];
+    int n_h_action_feats = history_actions.Shape()[1];
 
     state["obs:h_actions_"_].Assign((uint8_t *)history_actions[ha_p].Data(),
-                                    n_action_feats * n1);
+                                    n_h_action_feats * n1);
     state["obs:h_actions_"_][n1].Assign((uint8_t *)history_actions.Data(),
-                                        n_action_feats * ha_p);
+                                        n_h_action_feats * ha_p);
+    for (int i = 0; i < n_history_actions_; ++i) {
+      if (uint8_t(state["obs:h_actions_"_](i, 3)) == 0) {
+        break;
+      }
+      int turn_diff = std::min(
+          16, turn_count_ - int(uint8_t(state["obs:h_actions_"_](i, 12))));
+      state["obs:h_actions_"_](i, 12) = static_cast<uint8_t>(turn_diff);
+    }
   }
 
   int prev_msg_for_retry_ = 0;
@@ -3200,8 +3122,14 @@ private:
             prev_msg_for_retry_ = msg_;
             prev_option_for_retry_ = options_[0];
             callback_(0);
-            update_h_card_ids(to_play_, 0);
-            update_history_actions(to_play_, 0);
+            {
+              auto la = legal_actions_[0];
+              la.msg_ = msg_;
+              if (la.cid_ == 0 && !la.spec_.empty()) {
+                la.cid_ = spec_to_card_id(la.spec_, to_play_);
+              }
+              update_history_actions(to_play_, la);
+            }
             if (verbose_) {
               show_decision(0);
             }
