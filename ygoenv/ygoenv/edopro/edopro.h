@@ -1992,6 +1992,9 @@ protected:
   FILE* fp_ = nullptr;
   bool is_recording = false;
 
+  // reward shaping (ygopro-layout config key; flat ±1 when false)
+  bool greedy_reward_ = true;
+
 public:
   EDOProEnv(const Spec &spec, int env_id)
       : Env<EDOProEnvSpec>(spec, env_id),
@@ -2008,6 +2011,7 @@ public:
         play_modes_(parse_play_modes(spec.config["play_mode"_])),
         verbose_(spec.config["verbose"_]), record_(spec.config["record"_]),
         n_history_actions_(spec.config["n_history_actions"_]) {
+    greedy_reward_ = spec.config["greedy_reward"_];
     if (record_) {
       if (!verbose_) {
         throw std::runtime_error("record mode must be used with verbose mode and num_envs=1");
@@ -2315,16 +2319,33 @@ public:
     int reason = 0;
     // winner_ == 255 means truncation draw (loop guard): reward stays 0.
     if (done_ && winner_ != 255) {
+      // Upstream ygopro shaping, gated on greedy_reward: fast wins pay more,
+      // with the going-first winner on a doubled ladder (turn 1 = FTK).
       float base_reward = 1.0;
-      int win_turn = turn_count_ - winner_;
-      if (win_turn <= 1) {
-        base_reward = 8.0;
-      } else if (win_turn <= 3) {
-        base_reward = 4.0;
-      } else if (win_turn <= 5) {
-        base_reward = 2.0;
-      } else {
-        base_reward = 0.5 + 1.0 / (win_turn - 5);
+      if (greedy_reward_) {
+        if (winner_ == 0) {
+          if (turn_count_ <= 1) {
+            base_reward = 16.0;
+          } else if (turn_count_ <= 3) {
+            base_reward = 8.0;
+          } else if (turn_count_ <= 5) {
+            base_reward = 4.0;
+          } else if (turn_count_ <= 7) {
+            base_reward = 2.0;
+          } else {
+            base_reward = 0.5 + 1.0 / (turn_count_ - 7);
+          }
+        } else {
+          if (turn_count_ <= 1) {
+            base_reward = 8.0;
+          } else if (turn_count_ <= 3) {
+            base_reward = 4.0;
+          } else if (turn_count_ <= 5) {
+            base_reward = 2.0;
+          } else {
+            base_reward = 0.5 + 1.0 / (turn_count_ - 5);
+          }
+        }
       }
       if (play_mode_ == kSelfPlay) {
         // to_play_ is the previous player
@@ -2820,7 +2841,9 @@ private:
     state["info:to_play"_] = int(to_play_);
     state["info:is_selfplay"_] = int(play_mode_ == kSelfPlay);
     state["info:win_reason"_] = win_reason;
-    if (reward != 0.0) {
+    // Episode end (done_), not reward != 0: truncation draws end with
+    // reward 0 and still need their matchup label for eval bucketing.
+    if (done_) {
       state["info:step_time"_][0] = 0;
       state["info:step_time"_][1] = 0;
       state["info:deck"_][0] = deck_name_id(deck_name_[0]);
@@ -2849,6 +2872,10 @@ private:
 
     // we can't shuffle because idx must be stable in callback
     if (n_options > max_options()) {
+      // This CLIPS legal play (drops trailing options). Diagnostic keeps the
+      // rate measurable in run logs; the fix is raising max_options.
+      fmt::print(stderr, "[optclip] msg={} options={} max={}\n",
+                 msg_to_string(msg_), n_options, max_options());
       options_.resize(max_options());
       legal_actions_.resize(max_options());
     }
