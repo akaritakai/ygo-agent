@@ -715,6 +715,10 @@ def main():
 
     ckpt_maneger = ModelCheckpoint(
         args.ckpt_dir, save_fn, n_saved=2)
+    # Actor-only .flax_model files serve eval; true resume also needs the
+    # critic, saved alongside as .resume.flax_model bundles.
+    resume_ckpt_maneger = ModelCheckpoint(
+        os.path.join(args.ckpt_dir, "resume"), save_fn, n_saved=2)
 
     # seeding
     random.seed(args.seed)
@@ -766,10 +770,34 @@ def main():
         for v in [actor_variables, critic_variables]:
             v['params']['Encoder_0']['Embed_0']['embedding'] = jax.device_put(embeddings)
     if args.checkpoint:
+        # (Upstream this branch crashed: `variables` was never defined, and
+        # the tuple it implied was never what save wrote.) Two real formats:
+        # .resume.flax_model = {'params'/'batch_stats': {'actor','critic'}}
+        # (full resume); plain .flax_model = actor-only (eval format; the
+        # critic then starts fresh — warm-start, not a faithful resume).
         with open(args.checkpoint, "rb") as f:
-            variables = flax.serialization.from_bytes(variables, f.read())
-            actor_variables, critic_variables = variables
-        print(f"loaded checkpoint from {args.checkpoint}")
+            ckpt_bytes = f.read()
+        for v in [actor_variables, critic_variables]:
+            if 'batch_stats' not in v:
+                v['batch_stats'] = {}
+        if args.checkpoint.endswith(".resume.flax_model"):
+            template = {
+                'params': {'actor': actor_variables['params'],
+                           'critic': critic_variables['params']},
+                'batch_stats': {'actor': actor_variables['batch_stats'],
+                                'critic': critic_variables['batch_stats']},
+            }
+            loaded = flax.serialization.from_bytes(template, ckpt_bytes)
+            actor_variables = {'params': loaded['params']['actor'],
+                               'batch_stats': loaded['batch_stats']['actor']}
+            critic_variables = {'params': loaded['params']['critic'],
+                                'batch_stats': loaded['batch_stats']['critic']}
+            print(f"resumed actor+critic from {args.checkpoint}")
+        else:
+            actor_variables = flax.serialization.from_bytes(
+                actor_variables, ckpt_bytes)
+            print(f"loaded actor-only checkpoint from {args.checkpoint} "
+                  f"(critic starts fresh)")
 
     tx = optax.MultiSteps(
         optax.chain(
@@ -1194,6 +1222,9 @@ def main():
             M_steps = tb_global_step // 2**20
             ckpt_name = f"{timestamp}_{M_steps}M.flax_model"
             ckpt_maneger.save(unreplicated_params, ckpt_name)
+            resume_ckpt_maneger.save(
+                flax.jax_utils.unreplicate(get_variables(agent_state)),
+                f"{timestamp}_{M_steps}M.resume.flax_model")
             if args.gcs_bucket is not None:
                 lastest_path = ckpt_maneger.get_latest()
                 copy_path = lastest_path.with_name("latest" + lastest_path.suffix)
