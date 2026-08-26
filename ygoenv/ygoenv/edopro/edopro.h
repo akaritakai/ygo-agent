@@ -2961,16 +2961,24 @@ private:
       if (i) acts += ",";
       acts += std::to_string(action_history_[i]);
     }
+    // max_options/n_history_actions are part of the replay contract: a
+    // recorded action is an INDEX into a clipped option list, so replaying at
+    // a different max_options makes recorded indices point elsewhere (or out
+    // of range). Stamp them so the replay can reproduce the decision surface
+    // instead of guessing the env defaults.
     fmt::print(stderr,
                "[incident] {{\"cause\":\"{}\",\"build\":\"{}\","
                "\"deck1\":\"{}\",\"deck2\":\"{}\","
                "\"duel_seed\":{},\"turn\":{},\"last_chain_code\":{},"
-               "\"chains_since_decision\":{},\"actions\":[{}],"
+               "\"chains_since_decision\":{},"
+               "\"max_options\":{},\"n_history_actions\":{},"
+               "\"actions\":[{}],"
                "\"main0\":\"{}\",\"extra0\":\"{}\","
                "\"main1\":\"{}\",\"extra1\":\"{}\"}}\n",
                cause, YGOENV_BUILD_ID, deck_name_[0], deck_name_[1], duel_seed_,
                turn_count_,
-               loop_cause_code_, chains_since_decision_, acts,
+               loop_cause_code_, chains_since_decision_,
+               max_options(), n_history_actions_, acts,
                join(main_deck0_), join(extra_deck0_),
                join(main_deck1_), join(extra_deck1_));
   }
