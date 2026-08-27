@@ -695,6 +695,11 @@ static const std::vector<int> _msgs = {
     MSG_SELECT_OPTION,   MSG_SELECT_PLACE,     MSG_SELECT_SUM,
     MSG_SELECT_DISFIELD, MSG_ANNOUNCE_ATTRIB,  MSG_ANNOUNCE_NUMBER,
     MSG_ANNOUNCE_CARD, MSG_ANNOUNCE_RACE,
+    // Appended (never inserted): make_ids numbers these in order, so adding at
+    // the end leaves every existing id untouched and keeps already-trained
+    // checkpoints readable. Omitting MSG_SORT_CARD here is what made
+    // msg2id.at(msg) throw for any sort action.
+    MSG_SORT_CARD,
 };
 
 static const ankerl::unordered_dense::map<int, uint8_t> msg2id =
@@ -2638,7 +2643,8 @@ private:
     _set_obs_action_msg(feat, i, msg);
     _set_obs_action_card_id(feat, i, action.cid_);
     if (msg == MSG_SELECT_CARD || msg == MSG_SELECT_TRIBUTE ||
-        msg == MSG_SELECT_SUM || msg == MSG_SELECT_UNSELECT_CARD) {
+        msg == MSG_SELECT_SUM || msg == MSG_SELECT_UNSELECT_CARD ||
+        msg == MSG_SORT_CARD) {
       if (action.finish_) {
         _set_obs_action_finish(feat, i);
       } else {
@@ -4153,59 +4159,62 @@ private:
         players_[pl]->notify(str);
       }
     } else if (msg_ == MSG_SORT_CARD) {
-      // NOT IMPLEMENTED, deliberately: answering -1 takes the engine's
-      // default order. This forfeits a real strategic choice (the ordering
-      // decides future draws), so it is a genuine legality gap -- measured at
-      // ~91 occurrences in a partial 15-deck random sweep, sizes 2..8.
+      // Ordering the cards a search/excavate puts back decides future draws,
+      // so it is a real choice; this used to answer -1 and take the engine's
+      // default, i.e. the policy never made it. Measured at ~0.53 per episode
+      // in the Kewl Tune mirror.
       //
-      // ATTEMPTED 2026-08-27 and reverted. The iterative design is right
-      // (permutations are factorial -- size 8 = 40,320 -- so the D4 Stage B
-      // multi-select applies, with the pick order as the ordering and the
-      // response written as its INVERSE, since the core applies
-      // tc[resp[i]] = select_cards[i]). What blocks it is deeper: the cards
-      // being sorted are in the DECK, and `ls_to_spec` has no case for
-      // LOCATION_DECK, so a deck card produces a spec with no location letter
-      // ("3"), which spec_to_ls misparses -> get_card_code returns a bogus
-      // code -> card_ids_.at() throws. Implementing this therefore needs the
-      // spec vocabulary AND the obs card encoder extended to represent
-      // revealed deck cards -- which is a client-view question too (deck
-      // cards are hidden in general, but ARE revealed to that player during a
-      // sort, so per-seat visibility has to be modelled, not bypassed).
-      // Tracked as a Phase-1 design item alongside the announce_card action
-      // model. Note the permutation code upstream left commented here was
-      // 1-indexed and would have been rejected outright: the core validates
-      // 0 <= v < m.
-      if (!verbose_) {
-        {
-          auto save_dp = dp_;
-          read_u8();
-          auto n = compat_read<uint8_t, uint32_t>();
-          fmt::print(stderr, "[sortcard] size={}\n", n);
-          dp_ = save_dp;
-        }
-        dp_ = dl_;
-        YGO_SetResponsei(pduel_, -1);
-        return;
-      }
+      // Enumerating permutations is factorial (size 8 = 40,320), so this uses
+      // the D4 Stage B iterative multi-select exactly as notes/03 section 3
+      // prescribes for ordering messages ("autoregressive permutation, pick
+      // next until done"): the agent picks the card for each position in turn
+      // and the accumulated pick order IS the ordering. min == max == size, so
+      // every card gets placed; the engine's default stays reachable as the
+      // identity order.
       auto player = read_u8();
       auto size = compat_read<uint8_t, uint32_t>();
+      std::vector<std::string> specs;
+      specs.reserve(size);
       std::vector<Card> cards;
+      if (verbose_) {
+        cards.reserve(size);
+      }
       for (int i = 0; i < size; ++i) {
-        read_u32();
-        auto c = read_u8();
+        auto code = read_u32();
+        auto controller = read_u8();
         auto loc = compat_read<uint8_t, uint32_t>();
         auto seq = compat_read<uint8_t, uint32_t>();
-        cards.push_back(get_card(c, loc, seq));
+        if (verbose_) {
+          cards.push_back(get_card(controller, loc, seq));
+        }
+        specs.push_back(ls_to_spec(static_cast<uint8_t>(loc),
+                                   static_cast<uint8_t>(seq), 0,
+                                   controller != player));
       }
-      auto pl = players_[player];
-      pl->notify(
-          "Sort " + std::to_string(size) +
-          " cards by entering numbers separated by spaces (c = cancel):");
-      for (int i = 0; i < size; ++i) {
-        pl->notify(fmt::format("{}: {}", i + 1, cards[i].name_));
+      if (verbose_) {
+        auto pl = players_[player];
+        pl->notify("Sort " + std::to_string(size) +
+                   " cards by entering numbers separated by spaces:");
+        for (int i = 0; i < size; ++i) {
+          pl->notify(fmt::format("{}: {}", i + 1, cards[i].name_));
+        }
       }
-      fmt::println("sort card action not implemented");
-      YGO_SetResponsei(pduel_, -1);
+      to_play_ = player;
+      auto send = [this](const std::vector<int> &order) {
+        // order[k] is the card chosen for position k. The core applies
+        //     tc[resp[i]] = select_cards[i]      (processor.cpp)
+        // so resp[i] is the DESTINATION of card i -- the INVERSE of the pick
+        // order. Writing the pick order straight in would silently produce a
+        // different, wrong ordering. (The permutation code upstream left
+        // commented here was 1-indexed and would have been rejected outright:
+        // the core validates 0 <= v < m.)
+        for (int k = 0; k < static_cast<int>(order.size()); ++k) {
+          resp_buf_[order[k]] = static_cast<uint8_t>(k);
+        }
+        YGO_SetResponseb(pduel_, resp_buf_,
+                         static_cast<uint32_t>(order.size()));
+      };
+      init_multi_select(size, size, specs, 0, {}, send);
     } else if (msg_ == MSG_ADD_COUNTER) {
       if (!verbose_) {
         dp_ = dl_;
