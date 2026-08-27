@@ -275,9 +275,21 @@ def vtrace_sep_loop(carry, inp, gamma, rho_min, rho_max, c_min, c_max):
     ratio, cur_value, next_done, r_t, main = inp
 
 
-    v1, v2, next_value1, next_value2, reward1, reward2, xi1, xi2 = jax.tree.map(
+    v1, v2, next_value1, next_value2, reward1, reward2 = jax.tree.map(
         lambda x: jnp.where(next_done, 0, x),
-        (v1, v2, next_value1, next_value2, reward1, reward2, xi1, xi2))
+        (v1, v2, next_value1, next_value2, reward1, reward2))
+    # xi is a MULTIPLICATIVE accumulator -- the product of the off-turn
+    # player's importance ratios, seeded with ones and reset to 1 on the
+    # acting player's own step below -- so its identity is 1, not 0.
+    # Zeroing it at an episode boundary (as the additive carries above
+    # correctly are) drove rho_t = clip(ratio * xi, rho_min, ...) to rho_min,
+    # i.e. 0.001. The terminal reward is the ONLY reward this game has, so
+    # the value target at a terminal became cur_value + 0.001*(r - cur_value)
+    # and the critic never learned: measured value_loss ~5e-7 and critic
+    # outputs spanning +-0.009 against rewards of +-1. Advantages were
+    # unaffected (q_t does not use rho), which is why the policy still
+    # improved while the baseline stayed dead.
+    xi1, xi2 = jax.tree.map(lambda x: jnp.where(next_done, 1, x), (xi1, xi2))
 
     discount = gamma * (1.0 - next_done)
     v = jnp.where(main, v1, v2)
