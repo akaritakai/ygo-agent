@@ -3568,6 +3568,32 @@ private:
         push_action(LegalAction::from_spec(ms_specs_[i]), ms_specs_[i]);
       }
     }
+    // Shadow-parser count invariant (G0). The number of options we present
+    // must equal what the message's own bookkeeping implies: every spec not
+    // yet chosen, plus "finish" once the minimum is met. A mismatch means the
+    // parser silently dropped or duplicated a legal choice -- exactly the
+    // class of bug [optclip] caught for max_options, but invisible because a
+    // shorter option list still looks like a valid decision.
+    if (ms_mode_ == 0) {
+      size_t expect = ms_spec2idx_.size() +
+          (static_cast<int>(ms_r_idxs_.size()) >= ms_min_ ? 1u : 0u);
+      if (options_.size() != expect) {
+        fmt::print(stderr,
+                   "[parsecount] msg={} mode=0 options={} expected={} "
+                   "specs={} selected={} min={}\n",
+                   msg_to_string(msg_), options_.size(), expect,
+                   ms_specs_.size(), ms_r_idxs_.size(), ms_min_);
+      }
+    }
+    // Presenting nothing is never legal: the player is on the clock and every
+    // action index would be out of range.
+    if (options_.empty()) {
+      fmt::print(stderr,
+                 "[parsecount] msg={} presented ZERO options "
+                 "(mode={} specs={} selected={} min={} max={})\n",
+                 msg_to_string(msg_), ms_mode_, ms_specs_.size(),
+                 ms_r_idxs_.size(), ms_min_, ms_max_);
+    }
     callback_ = [this](int idx) { ms_callback(idx); };
   }
 
