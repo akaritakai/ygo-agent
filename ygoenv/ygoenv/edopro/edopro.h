@@ -4153,8 +4153,36 @@ private:
         players_[pl]->notify(str);
       }
     } else if (msg_ == MSG_SORT_CARD) {
-      // TODO: implement action
+      // NOT IMPLEMENTED, deliberately: answering -1 takes the engine's
+      // default order. This forfeits a real strategic choice (the ordering
+      // decides future draws), so it is a genuine legality gap -- measured at
+      // ~91 occurrences in a partial 15-deck random sweep, sizes 2..8.
+      //
+      // ATTEMPTED 2026-08-27 and reverted. The iterative design is right
+      // (permutations are factorial -- size 8 = 40,320 -- so the D4 Stage B
+      // multi-select applies, with the pick order as the ordering and the
+      // response written as its INVERSE, since the core applies
+      // tc[resp[i]] = select_cards[i]). What blocks it is deeper: the cards
+      // being sorted are in the DECK, and `ls_to_spec` has no case for
+      // LOCATION_DECK, so a deck card produces a spec with no location letter
+      // ("3"), which spec_to_ls misparses -> get_card_code returns a bogus
+      // code -> card_ids_.at() throws. Implementing this therefore needs the
+      // spec vocabulary AND the obs card encoder extended to represent
+      // revealed deck cards -- which is a client-view question too (deck
+      // cards are hidden in general, but ARE revealed to that player during a
+      // sort, so per-seat visibility has to be modelled, not bypassed).
+      // Tracked as a Phase-1 design item alongside the announce_card action
+      // model. Note the permutation code upstream left commented here was
+      // 1-indexed and would have been rejected outright: the core validates
+      // 0 <= v < m.
       if (!verbose_) {
+        {
+          auto save_dp = dp_;
+          read_u8();
+          auto n = compat_read<uint8_t, uint32_t>();
+          fmt::print(stderr, "[sortcard] size={}\n", n);
+          dp_ = save_dp;
+        }
         dp_ = dl_;
         YGO_SetResponsei(pduel_, -1);
         return;
@@ -4176,40 +4204,8 @@ private:
       for (int i = 0; i < size; ++i) {
         pl->notify(fmt::format("{}: {}", i + 1, cards[i].name_));
       }
-
       fmt::println("sort card action not implemented");
       YGO_SetResponsei(pduel_, -1);
-
-      // // generate all permutations
-      // std::vector<int> perm(size);
-      // std::iota(perm.begin(), perm.end(), 0);
-      // std::vector<std::vector<int>> perms;
-      // do {
-      //   auto option = std::accumulate(perm.begin(), perm.end(),
-      //   std::string(),
-      //                                 [&](std::string &acc, int i) {
-      //                                   return acc + std::to_string(i + 1) +
-      //                                   " ";
-      //                                 });
-      //   options_.push_back(option);
-      // } while (std::next_permutation(perm.begin(), perm.end()));
-      // options_.push_back("c");
-      // callback_ = [this](int idx) {
-      //   const auto &option = options_[idx];
-      //   if (option == "c") {
-      //     resp_buf_[0] = 255;
-      //     YGO_SetResponseb(pduel_, resp_buf_);
-      //     return;
-      //   }
-      //   std::istringstream iss(option);
-      //   int x;
-      //   int i = 0;
-      //   while (iss >> x) {
-      //     resp_buf_[i] = uint8_t(x);
-      //     i++;
-      //   }
-      //   YGO_SetResponseb(pduel_, resp_buf_);
-      // };
     } else if (msg_ == MSG_ADD_COUNTER) {
       if (!verbose_) {
         dp_ = dl_;
