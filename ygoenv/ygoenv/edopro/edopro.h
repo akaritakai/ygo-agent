@@ -1819,6 +1819,14 @@ public:
         "info:is_selfplay"_.Bind(Spec<int>({}, std::tuple<int, int>{0, 1})),
         "info:win_reason"_.Bind(Spec<int>({}, std::tuple<int, int>{-1, 1})),
         "info:step_time"_.Bind(Spec<double>({2})),
+        // 1 when the episode ended because a safety cap tripped rather than
+        // because the duel reached a real result. Such an episode is a
+        // MEASUREMENT FAILURE, not a game outcome: adjudicating it as a draw
+        // pays reward 0, which beats losing (-1) and is partly under the
+        // policy's control (build a board complex enough that the engine
+        // gives up), so it both corrupts the value target and creates a
+        // draw-seeking incentive. The trainer masks these transitions out.
+        "info:truncated"_.Bind(Spec<int>({}, std::tuple<int, int>{0, 1})),
         "info:deck"_.Bind(Spec<int>({2})));
   }
   template <typename Config>
@@ -2839,6 +2847,8 @@ private:
     int n_options = options_.size();
     state["reward"_] = reward;
     state["info:to_play"_] = int(to_play_);
+    // winner_ == 255 is our truncation sentinel (loop guard / process budget).
+    state["info:truncated"_] = int(done_ && winner_ == 255);
     state["info:is_selfplay"_] = int(play_mode_ == kSelfPlay);
     state["info:win_reason"_] = win_reason;
     // Episode end (done_), not reward != 0: truncation draws end with

@@ -171,6 +171,12 @@ class Args:
     bfloat16: bool = False
     """whether to use bfloat16 for the agent"""
     thread_affinity: bool = False
+    env_overprovision: float = 1.0
+    """D5: run this multiple of `local_num_envs` actual envs and step them
+    ASYNCHRONOUSLY, taking the first `local_num_envs` ready each recv(). 1.0
+    keeps the old synchronous path. >1 stops a single duel burning a huge
+    script search from stalling every other env in the batch -- measured at
+    ~75% of wall clock once the policy was good enough to build real boards."""
     """whether to use thread affinity for the environment"""
 
     eval_checkpoint: Optional[str] = None
@@ -198,16 +204,23 @@ class Args:
     real_seed: Optional[int] = None
 
 
-def make_env(args, seed, num_envs, num_threads, mode='self', thread_affinity_offset=-1, eval=False):
+def make_env(args, seed, num_envs, num_threads, mode='self', thread_affinity_offset=-1,
+             eval=False, batch_size=None):
     if not args.thread_affinity:
         thread_affinity_offset = -1
     if thread_affinity_offset >= 0:
         print("Binding to thread offset", thread_affinity_offset)
+    # batch_size < num_envs puts envpool in ASYNC mode: recv() returns the
+    # first `batch_size` envs that are ready instead of waiting for all of
+    # them, so one duel burning a huge script search no longer stalls every
+    # other env in the batch (D5).
+    extra = {} if batch_size is None else {"batch_size": batch_size}
     envs = ygoenv.make(
         task_id=args.env_id,
         env_type="gymnasium",
         num_envs=num_envs,
         num_threads=num_threads,
+        **extra,
         thread_affinity_offset=thread_affinity_offset,
         seed=seed,
         deck1=args.deck1,
@@ -232,6 +245,13 @@ class Transition(NamedTuple):
     rewards: list
     mains: list
     next_dones: list
+    # 0 for every transition of an episode that ended by hitting a safety cap
+    # rather than by reaching a real result. Such an episode is a MEASUREMENT
+    # FAILURE, not a game outcome -- adjudicating it as a draw pays reward 0,
+    # which beats losing and is partly under the policy's control, so it both
+    # corrupts the value target and creates a draw-seeking incentive. These
+    # transitions are masked out of the loss entirely.
+    valid: list
 
 
 def create_agent(args, actor=False, eval=False):
@@ -340,6 +360,97 @@ def advantage_fn(
             args.upgo, return_carry=return_carry)
 
 
+class AsyncCollector:
+    """D5: collect fixed-length BPTT segments from an ASYNC envpool.
+
+    envpool async mode hands back whichever `batch_size` envs are ready, so
+    consecutive batches are different env subsets. BPTT needs consistent env
+    identity along the time axis, so instead of forming (num_steps, num_envs)
+    tensors straight from the batches we keep one rolling buffer PER ENV and
+    emit a segment when a buffer fills. The learner therefore sees exactly the
+    same shapes as the synchronous path and needs no changes at all.
+
+    A slow duel simply contributes segments more slowly instead of stalling
+    every other env, which is the whole point.
+    """
+
+    def __init__(self, num_envs, num_steps):
+        self.num_steps = num_steps
+        self.buf = [[] for _ in range(num_envs)]
+        # The transition awaiting its reward: envpool reports the reward for
+        # action_{t-1} together with obs_t, so a transition can only be closed
+        # on the NEXT recv for that env.
+        self.pending = [None] * num_envs
+        # rstate that fed the pending transition, and the rstate at the start
+        # of the segment currently being filled.
+        self.pre_rstate = [None] * num_envs
+        self.seg_rstate = [None] * num_envs
+        self.ep_start = [0] * num_envs
+        self.ready = []
+        self.n_truncated = 0
+
+    def observe(self, e, obs_e, done_e, main_e, rstate_e, reward_e, truncated_e):
+        """Fold one env's new observation in, closing its pending transition."""
+        seg = None
+        pend = self.pending[e]
+        if pend is not None:
+            pend["rewards"] = reward_e
+            pend["next_dones"] = done_e
+            pend["valid"] = True
+            self.buf[e].append(pend)
+            if done_e:
+                if truncated_e:
+                    for t in self.buf[e][self.ep_start[e]:]:
+                        t["valid"] = False
+                    self.n_truncated += 1
+                self.ep_start[e] = len(self.buf[e])
+            if len(self.buf[e]) == self.num_steps:
+                # obs_e is the observation that follows the segment, which is
+                # exactly what the learner bootstraps from.
+                seg = (self.buf[e], self.seg_rstate[e], obs_e, main_e)
+                self.buf[e] = []
+                self.ep_start[e] = 0
+                self.seg_rstate[e] = rstate_e
+        if self.seg_rstate[e] is None:
+            self.seg_rstate[e] = rstate_e
+        self.pre_rstate[e] = rstate_e
+        return seg
+
+    def stage(self, e, obs_e, done_e, main_e, action_e, logits_e):
+        self.pending[e] = {
+            "obs": obs_e, "dones": done_e, "mains": main_e,
+            "actions": action_e, "logits": logits_e,
+        }
+
+
+def stack_segments(segments):
+    """(list of segments) -> Transition(num_steps, n_seg, ...), init_rstate, next_data."""
+    n_steps = len(segments[0][0])
+    def field(name):
+        return np.stack([[t[name] for t in seg[0]] for seg in segments], axis=1)
+    obs = {k: np.stack([[t["obs"][k] for t in seg[0]] for seg in segments], axis=1)
+           for k in segments[0][0][0]["obs"]}
+    storage = Transition(
+        obs=obs,
+        dones=field("dones"),
+        actions=field("actions"),
+        logits=field("logits"),
+        rewards=field("rewards"),
+        mains=field("mains"),
+        next_dones=field("next_dones"),
+        valid=field("valid"),
+    )
+    init_rstate1 = jax.tree.map(
+        lambda *xs: np.stack(xs), *[seg[1][0] for seg in segments])
+    init_rstate2 = jax.tree.map(
+        lambda *xs: np.stack(xs), *[seg[1][1] for seg in segments])
+    next_obs = {k: np.stack([seg[2][k] for seg in segments])
+                for k in segments[0][2]}
+    next_main = np.stack([seg[3] for seg in segments])
+    assert storage.dones.shape[0] == n_steps
+    return storage, (init_rstate1, init_rstate2), (next_obs, next_main)
+
+
 def rollout(
     key: jax.random.PRNGKey,
     args: Args,
@@ -357,13 +468,19 @@ def rollout(
     local_seed = args.real_seed + device_thread_id * args.local_num_envs
     np.random.seed(local_seed)
 
+    n_async_envs = int(args.local_num_envs * args.env_overprovision)
+    use_async = n_async_envs > args.local_num_envs
     envs = make_env(
         args,
         local_seed,
-        args.local_num_envs,
+        n_async_envs if use_async else args.local_num_envs,
         args.local_env_threads,
         thread_affinity_offset=device_thread_id * args.local_env_threads,
+        batch_size=args.local_num_envs if use_async else None,
     )
+    if use_async:
+        print(f"[D5] async envs: {n_async_envs} envs, batch {args.local_num_envs}",
+              flush=True)
     envs = EnvPreprocess(envs, skip_mask=False)
     envs = RecordEpisodeStatistics(envs)
 
@@ -430,8 +547,20 @@ def rollout(
     params_queue_get_time = deque(maxlen=10)
     rollout_time = deque(maxlen=10)
     actor_policy_version = 0
-    next_obs, info = envs.reset()
-    next_to_play = info["to_play"]
+    if use_async:
+        envs.async_reset()
+        next_obs = info = None
+        collector = AsyncCollector(n_async_envs, args.num_steps)
+        pending_segments = []
+        # rstate is per-env and an async batch is a varying subset, so it is
+        # held densely over ALL envs and gathered/scattered by env_id.
+        pool_rstate1 = jax.device_put(
+            actor.init_rnn_state(n_async_envs), actor_device)
+        pool_rstate2 = jax.device_put(
+            actor.init_rnn_state(n_async_envs), actor_device)
+    else:
+        next_obs, info = envs.reset()
+        next_to_play = info["to_play"]
     next_done = np.zeros(args.local_num_envs, dtype=np.bool_)
     next_rstate1 = next_rstate2 = actor.init_rnn_state(args.local_num_envs)
 
@@ -441,9 +570,10 @@ def rollout(
     next_rstate1, next_rstate2, eval_rstate1, eval_rstate2 = \
         jax.device_put([next_rstate1, next_rstate2, eval_rstate1, eval_rstate2], actor_device)
 
+    n_players = n_async_envs if use_async else args.local_num_envs
     main_player = np.concatenate([
-        np.zeros(args.local_num_envs // 2, dtype=np.int64),
-        np.ones(args.local_num_envs // 2, dtype=np.int64)
+        np.zeros(n_players // 2, dtype=np.int64),
+        np.ones(n_players - n_players // 2, dtype=np.int64)
     ])
     np.random.shuffle(main_player)
     start_step = 0
@@ -475,7 +605,83 @@ def rollout(
         params_queue_get_time.append(time.time() - params_queue_get_time_start)
 
         rollout_time_start = time.time()
-        for k in range(start_step, args.collect_steps):
+        valid_arr = np.ones((args.collect_steps, args.local_num_envs), dtype=bool)
+        ep_start = np.zeros(args.local_num_envs, dtype=int)
+        n_truncated = 0
+
+        if use_async:
+            # D5: pull ready batches until enough fixed-length segments exist.
+            # A duel stuck in a huge script search just contributes segments
+            # later instead of holding up every other env.
+            # Segments completed after the batch was already full carry over
+            # to the next update rather than being dropped: discarding them
+            # would waste real experience AND bias the data against exactly
+            # the slow envs this whole change exists to accommodate.
+            segments, pending_segments = pending_segments, []
+            while len(segments) < args.local_num_envs:
+                _s = time.time()
+                obs_b, reward_b, done_b, info_b = envs.recv()
+                env_time += time.time() - _s
+                eid = info_b["env_id"]
+                global_step += len(eid) * n_actors * args.world_size
+                main_b = main_player[eid] == info_b["to_play"]
+                trunc_b = info_b.get("truncated")
+
+                r1 = jax.tree.map(lambda x: x[eid], pool_rstate1)
+                r2 = jax.tree.map(lambda x: x[eid], pool_rstate2)
+
+                _s = time.time()
+                cached_obs, cached_done, cached_main, nr1, nr2, action, logits, key = \
+                    sample_action(params, obs_b, r1, r2, main_b, done_b, key)
+                cpu_action = np.array(action)
+                inference_time += time.time() - _s
+
+                _s = time.time()
+                envs.send(cpu_action, eid)
+                env_time += time.time() - _s
+
+                # Close each env's previous transition with the reward that
+                # just arrived, then stage the new one.
+                obs_np = {k_: np.asarray(v) for k_, v in obs_b.items()}
+                logits_np = np.asarray(logits)
+                for j, e in enumerate(eid):
+                    e = int(e)
+                    seg = collector.observe(
+                        e,
+                        {k_: obs_np[k_][j] for k_ in obs_np},
+                        bool(done_b[j]), bool(main_b[j]),
+                        (jax.tree.map(lambda x: np.asarray(x[j]), r1),
+                         jax.tree.map(lambda x: np.asarray(x[j]), r2)),
+                        float(reward_b[j]),
+                        bool(trunc_b[j]) if trunc_b is not None else False,
+                    )
+                    if seg is not None:
+                        (segments if len(segments) < args.local_num_envs
+                         else pending_segments).append(seg)
+                    collector.stage(
+                        e, {k_: obs_np[k_][j] for k_ in obs_np},
+                        bool(done_b[j]), bool(main_b[j]),
+                        int(cpu_action[j]), logits_np[j])
+                    if done_b[j]:
+                        ep_r = info_b["r"][j] * (1 if main_b[j] else -1)
+                        avg_ep_returns.append(ep_r)
+                        avg_win_rates.append(1 if ep_r > 0 else 0)
+
+                pool_rstate1 = jax.tree.map(
+                    lambda pool, new: pool.at[eid].set(new), pool_rstate1, nr1)
+                pool_rstate2 = jax.tree.map(
+                    lambda pool, new: pool.at[eid].set(new), pool_rstate2, nr2)
+
+            n_truncated = collector.n_truncated
+            collector.n_truncated = 0
+            extra = segments[args.local_num_envs:]
+            segments = segments[:args.local_num_envs]
+            pending_segments = extra + pending_segments
+            storage_np, init_rstate, next_data_np = stack_segments(segments)
+            rollout_time.append(time.time() - rollout_time_start)
+
+        for k in range(0 if use_async else start_step,
+                       0 if use_async else args.collect_steps):
             if k % args.num_steps == 0:
                 init_rstate1, init_rstate2 = jax.tree.map(
                     lambda x: x.copy(), (next_rstate1, next_rstate2))
@@ -506,12 +712,25 @@ def rollout(
                     logits=logits,
                     rewards=next_reward,
                     next_dones=next_done,
+                    valid=np.ones_like(next_done),  # filled in below
                 )
             )
 
+            # An episode that ended by tripping a safety cap is a measurement
+            # failure, not a result: invalidate every transition of it that is
+            # still in this segment so the loss never sees it. (Its earlier
+            # steps may have gone out in a previous segment; those bootstrap
+            # from the segment edge rather than from the fake terminal, so
+            # they are far less contaminated.)
+            step_idx = len(storage) - 1
+            trunc_flags = info.get("truncated")
             for idx, d in enumerate(next_done):
                 if not d:
                     continue
+                if trunc_flags is not None and trunc_flags[idx]:
+                    valid_arr[ep_start[idx]:step_idx + 1, idx] = False
+                    n_truncated += 1
+                ep_start[idx] = step_idx + 1
                 cur_main = main[idx]
 
                 
@@ -535,12 +754,38 @@ def rollout(
                 avg_ep_returns.append(episode_reward)
                 avg_win_rates.append(win)
 
-        rollout_time.append(time.time() - rollout_time_start)
+        if not use_async:
+            rollout_time.append(time.time() - rollout_time_start)
 
         start_step = args.collect_steps - args.num_steps
 
-        next_main = main_player == next_to_play
-        if args.collect_steps == args.num_steps:
+        if use_async:
+            # The async collector already produced exactly the shapes the
+            # learner expects; skip the synchronous storage assembly.
+            storage_t = None
+            next_data = next_data_np
+            partitioned_storage = jax.tree.map(
+                lambda x: jnp.split(jnp.asarray(x), len(learner_devices), axis=1),
+                storage_np)
+            sharded_storage = []
+            for x in partitioned_storage:
+                if isinstance(x, dict):
+                    x = {k: _device_put_sharded(v, devices=learner_devices)
+                         for k, v in x.items()}
+                else:
+                    x = _device_put_sharded(x, devices=learner_devices)
+                sharded_storage.append(x)
+            sharded_storage = Transition(*sharded_storage)
+            sharded_data = jax.tree.map(
+                lambda x: _device_put_sharded(
+                    np.split(np.asarray(x), len(learner_devices)),
+                    devices=learner_devices),
+                (init_rstate, next_data))
+        else:
+            next_main = main_player == next_to_play
+        if use_async:
+            pass
+        elif args.collect_steps == args.num_steps:
             storage_t = storage
             storage = []
             next_data = (next_obs, next_main)
@@ -558,24 +803,26 @@ def rollout(
                 next_value, values, rewards, next_dones, mains)
             next_data = adv_carry
 
-        partitioned_storage = jax.tree.map(
-            lambda x: jnp.split(x, len(learner_devices), axis=1), prepare_data(storage_t))
-        sharded_storage = []
-        for x in partitioned_storage:
-            if isinstance(x, dict):
-                x = {
-                    k: _device_put_sharded(v, devices=learner_devices) if v is not None else None
-                    for k, v in x.items()
-                }
-            elif x is not None:
-                x = _device_put_sharded(x, devices=learner_devices)
-            sharded_storage.append(x)
-        sharded_storage = Transition(*sharded_storage)
+        if not use_async:
+            storage_t = [t._replace(valid=valid_arr[i]) for i, t in enumerate(storage_t)]
+            partitioned_storage = jax.tree.map(
+                lambda x: jnp.split(x, len(learner_devices), axis=1), prepare_data(storage_t))
+            sharded_storage = []
+            for x in partitioned_storage:
+                if isinstance(x, dict):
+                    x = {
+                        k: _device_put_sharded(v, devices=learner_devices) if v is not None else None
+                        for k, v in x.items()
+                    }
+                elif x is not None:
+                    x = _device_put_sharded(x, devices=learner_devices)
+                sharded_storage.append(x)
+            sharded_storage = Transition(*sharded_storage)
 
-        init_rstate = init_rstates.pop(0)
-        sharded_data = jax.tree.map(lambda x: _device_put_sharded(
-                np.split(x, len(learner_devices)), devices=learner_devices),
-                         (init_rstate, next_data))
+            init_rstate = init_rstates.pop(0)
+            sharded_data = jax.tree.map(lambda x: _device_put_sharded(
+                    np.split(x, len(learner_devices)), devices=learner_devices),
+                             (init_rstate, next_data))
 
         if args.eval_interval and update % args.eval_interval == 0:
             _start = time.time()
@@ -626,6 +873,7 @@ def rollout(
             writer.add_scalar("stats/params_queue_get_time", np.mean(params_queue_get_time), tb_global_step)
             writer.add_scalar("stats/inference_time", inference_time, tb_global_step)
             writer.add_scalar("stats/env_time", env_time, tb_global_step)
+            writer.add_scalar("charts/truncated_episodes", n_truncated, tb_global_step)
             writer.add_scalar("charts/SPS", SPS, tb_global_step)
             writer.add_scalar("charts/SPS_update", SPS_update, tb_global_step)
 
@@ -1039,7 +1287,9 @@ def main():
                 jax.tree.map(partial(convert_data, multi_step=False),
                              (init_rstate, next_data))
             b_storage = jax.tree.map(convert_data, storage)
-            b_mask = ~b_storage.dones
+            # `dones` marks a reset observation; `valid` marks transitions that
+            # belong to a real (non-cap-truncated) episode. Both are excluded.
+            b_mask = (~b_storage.dones) & b_storage.valid
             b_rewards = b_storage.rewards
 
             if args.segment_length is None:
