@@ -2697,7 +2697,12 @@ private:
       offset++;
     }
     auto [loc, seq, pos] = spec_to_ls(spec.substr(offset));
-    return card_ids_.at(get_card_code(player, loc, seq));
+    auto code = get_card_code(player, loc, seq);
+    if (code == 0) {
+      return 0;  // unknown card id; the feature degrades, the run continues
+    }
+    auto it = card_ids_.find(code);
+    return it == card_ids_.end() ? 0 : it->second;
   }
 
   void str_to_uint16(const char* src, uint16_t* dest) {
@@ -3172,15 +3177,19 @@ private:
           if (options_.size() == 1) {
             prev_msg_for_retry_ = msg_;
             prev_option_for_retry_ = options_[0];
-            callback_(0);
-            {
-              auto la = legal_actions_[0];
-              la.msg_ = msg_;
-              if (la.cid_ == 0 && !la.spec_.empty()) {
-                la.cid_ = spec_to_card_id(la.spec_, to_play_);
-              }
-              update_history_actions(to_play_, la);
+            // Resolve the card id BEFORE callback_ runs. The callback answers
+            // the decision, which can move the card out of the zone its spec
+            // names; querying afterwards then fails and get_card_code throws,
+            // aborting the whole process. This killed a training run at 6.55M
+            // steps -- rare because it needs a single-option decision whose
+            // card leaves its zone as a direct result.
+            auto la = legal_actions_[0];
+            la.msg_ = msg_;
+            if (la.cid_ == 0 && !la.spec_.empty()) {
+              la.cid_ = spec_to_card_id(la.spec_, to_play_);
             }
+            callback_(0);
+            update_history_actions(to_play_, la);
             if (verbose_) {
               show_decision(0);
             }
@@ -3410,13 +3419,19 @@ private:
     return c;
   }
 
+  // Returns 0 when the card cannot be queried (it moved, or the spec names a
+  // zone that is now empty). Callers that only want a history/obs FEATURE must
+  // tolerate that: killing a multi-day training run over a cosmetic id is
+  // never the right trade. Callers that need a real code should check for 0.
   CardCode get_card_code(PlayerId player, uint8_t loc, uint8_t seq) {
     int32_t flags = QUERY_CODE;
     int32_t bl = YGO_QueryCard(pduel_, player, loc, seq, flags, query_buf_);
     qdp_ = 0;
     QueryResult r;
     if (bl <= 0 || !q_parse_card_tlv(bl, r)) {
-      throw std::runtime_error("[get_card_code] Invalid card");
+      fmt::print(stderr, "[cardquery] miss player={} loc={} seq={}\n",
+                 int(player), int(loc), int(seq));
+      return 0;
     }
     return r.code;
   }
