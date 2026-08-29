@@ -547,6 +547,7 @@ def rollout(
     params_queue_get_time = deque(maxlen=10)
     rollout_time = deque(maxlen=10)
     actor_policy_version = 0
+    n_truncated = 0  # accumulates until it is actually logged
     if use_async:
         envs.async_reset()
         next_obs = info = None
@@ -607,7 +608,6 @@ def rollout(
         rollout_time_start = time.time()
         valid_arr = np.ones((args.collect_steps, args.local_num_envs), dtype=bool)
         ep_start = np.zeros(args.local_num_envs, dtype=int)
-        n_truncated = 0
 
         if use_async:
             # D5: pull ready batches until enough fixed-length segments exist.
@@ -672,7 +672,13 @@ def rollout(
                 pool_rstate2 = jax.tree.map(
                     lambda pool, new: pool.at[eid].set(new), pool_rstate2, nr2)
 
-            n_truncated = collector.n_truncated
+            # ACCUMULATE, do not reset per update: the tb scalar is only
+            # written every log_frequency updates, so resetting here threw
+            # away any truncation landing on an un-logged update. With trips
+            # as rare as 1 per ~1.7M steps that silently reported ZERO while
+            # truncations were really happening -- the counter said the rail
+            # never fired when it had fired twice.
+            n_truncated += collector.n_truncated
             collector.n_truncated = 0
             extra = segments[args.local_num_envs:]
             segments = segments[:args.local_num_envs]
@@ -874,6 +880,7 @@ def rollout(
             writer.add_scalar("stats/inference_time", inference_time, tb_global_step)
             writer.add_scalar("stats/env_time", env_time, tb_global_step)
             writer.add_scalar("charts/truncated_episodes", n_truncated, tb_global_step)
+            n_truncated = 0
             writer.add_scalar("charts/SPS", SPS, tb_global_step)
             writer.add_scalar("charts/SPS_update", SPS_update, tb_global_step)
 
@@ -1470,11 +1477,16 @@ def main():
 
         if args.local_rank == 0 and learner_policy_version % args.save_interval == 0 and not args.debug:
             M_steps = tb_global_step // 2**20
-            ckpt_name = f"{timestamp}_{M_steps}M.flax_model"
+            # global_step, not M_steps: M_steps truncates to whole millions and
+            # the timestamp is fixed at run start, so saves inside the same
+            # million COLLIDED and overwrote each other -- a run ended up with
+            # one file. Evaluation needs frozen past checkpoints as ladder
+            # rungs (bot/tools/ckpt_ladder.py), so every save must be distinct.
+            ckpt_name = f"{timestamp}_s{global_step:09d}.flax_model"
             ckpt_maneger.save(unreplicated_params, ckpt_name)
             resume_ckpt_maneger.save(
                 flax.jax_utils.unreplicate(get_variables(agent_state)),
-                f"{timestamp}_{M_steps}M.resume.flax_model")
+                f"{timestamp}_s{global_step:09d}.resume.flax_model")
             if args.gcs_bucket is not None:
                 lastest_path = ckpt_maneger.get_latest()
                 copy_path = lastest_path.with_name("latest" + lastest_path.suffix)
