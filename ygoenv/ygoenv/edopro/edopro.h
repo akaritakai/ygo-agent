@@ -4170,7 +4170,19 @@ private:
         if (verbose_) {
           cards.push_back(get_card(c, loc, seq));
         }
-        revealed_.push_back(ls_to_spec(loc, seq, 0, c == player));
+        // 'o' prefix means "belongs to the opponent OF THE VIEWER". The viewer
+        // here is `player` (MSG_CONFIRM_CARDS's first field is who is shown the
+        // cards), so a card controlled by `c` is an opponent card iff
+        // c != player. This was `c == player` -- inverted -- so a revealed
+        // opponent hand was stored as "h2" while _set_obs_cards looks it up as
+        // "oh2" via get_spec(opponent). They could never match: the reveal
+        // mechanism has never surfaced anything in the observation.
+        revealed_.push_back(ls_to_spec(loc, seq, 0, c != player));
+        if (std::getenv("YGOENV_REVEAL_DEBUG")) {
+          fmt::print(stderr, "[reveal] to=P{} owner=P{} loc={} seq={} spec={}\n",
+                     int(player), int(c), int(loc), int(seq),
+                     ls_to_spec(loc, seq, 0, c == player));
+        }
         if (loc & LOCATION_HAND) {
           revealed_owner_ = c;
           revealed_hand_n_ = YGO_QueryFieldCount(pduel_, c, LOCATION_HAND);
