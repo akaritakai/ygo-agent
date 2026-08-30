@@ -1995,7 +1995,18 @@ protected:
   TArray<uint8_t> history_actions_1_;
   int ha_p_1_ = 0;
 
+  // Cards of the opponent's hand that this seat has legitimately SEEN (e.g.
+  // "Kewl Tune Rotary": "Look at your opponent's hand"). This is public
+  // knowledge to the player who looked, so keeping it is MORE faithful to the
+  // client view, not less (D4 invariant).
+  //
+  // Specs are POSITIONAL ("h3"), so they go stale the moment that hand changes
+  // size -- a remembered "h2" would then unhide a different card, which is a
+  // real information leak. So we record whose hand was seen and how big it was,
+  // and treat the knowledge as void as soon as that no longer matches.
   std::vector<std::string> revealed_;
+  PlayerId revealed_owner_ = 255;
+  int revealed_hand_n_ = -1;
 
   // discard hand cards
   bool discard_hand_ = false;
@@ -2068,6 +2079,10 @@ public:
     fdl_ = 0;
     chains_since_decision_ = 0;
     loop_cause_code_ = 0;
+    // positional specs from a previous duel would unhide unrelated cards
+    revealed_.clear();
+    revealed_owner_ = 255;
+    revealed_hand_n_ = -1;
     if (random_mode()) {
       play_mode_ = play_modes_[dist_int_(gen_) % play_modes_.size()];
     } else {
@@ -2415,10 +2430,16 @@ private:
           {LOCATION_GRAVE, false}, {LOCATION_REMOVED, false},
           {LOCATION_EXTRA, true},
       };
+      // Hand knowledge is only usable while the seen hand is unchanged; a
+      // different size means positions shifted and every remembered spec now
+      // points somewhere else.
+      const bool reveal_valid =
+          !revealed_.empty() && revealed_owner_ != 255 &&
+          revealed_hand_n_ ==
+              YGO_QueryFieldCount(pduel_, revealed_owner_, LOCATION_HAND);
       for (auto &[location, hidden_for_opponent] : configs) {
-        // check this
-        if (opponent && (location == LOCATION_HAND) &&
-            (revealed_.size() != 0)) {
+        if (opponent && (location == LOCATION_HAND) && reveal_valid &&
+            player == revealed_owner_) {
           hidden_for_opponent = false;
         }
         if (opponent && hidden_for_opponent) {
@@ -2444,7 +2465,8 @@ private:
             bool hide = false;
             if (opponent) {
               hide = c.position_ & POS_FACEDOWN;
-              if ((location == LOCATION_HAND) &&
+              if ((location == LOCATION_HAND) && reveal_valid &&
+                  player == revealed_owner_ &&
                   (std::find(revealed_.begin(), revealed_.end(), spec) !=
                    revealed_.end())) {
                 hide = false;
@@ -3738,6 +3760,9 @@ private:
     } else if (msg_ == MSG_NEW_TURN) {
       tp_ = int(read_u8());
       turn_count_++;
+      revealed_.clear();
+      revealed_owner_ = 255;
+      revealed_hand_n_ = -1;
       if (!verbose_) {
         return;
       }
@@ -4146,6 +4171,10 @@ private:
           cards.push_back(get_card(c, loc, seq));
         }
         revealed_.push_back(ls_to_spec(loc, seq, 0, c == player));
+        if (loc & LOCATION_HAND) {
+          revealed_owner_ = c;
+          revealed_hand_n_ = YGO_QueryFieldCount(pduel_, c, LOCATION_HAND);
+        }
       }
       if (!verbose_) {
         return;
@@ -4393,7 +4422,12 @@ private:
       dp_ = dl_;
     } else if (msg_ == MSG_CHAIN_SOLVED) {
       dp_ = dl_;
-      revealed_.clear();
+      // NOT cleared here any more. Clearing at chain resolution threw away
+      // hand knowledge the instant it was obtained, so a policy that looked at
+      // the opponent's hand could not use it when choosing its endboard 20-80
+      // decisions later -- it had to memorise it through the RNN. The reveal
+      // now survives to the end of the turn (MSG_NEW_TURN), guarded by the
+      // hand-size check in _set_obs_cards.
     } else if (msg_ == MSG_CHAIN_SOLVING) {
       dp_ = dl_;
     } else if (msg_ == MSG_CHAINED) {
