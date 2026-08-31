@@ -1904,6 +1904,14 @@ protected:
   PlayerId ai_player_;
 
   OCG_Duel pduel_;
+  // pduel_ liveness. _duel_end destroys the duel but leaves pduel_ dangling,
+  // and the loop-guard truncation paths and mid-episode Reset() never
+  // destroyed it at all -- every abandoned episode leaked a full duel (Lua
+  // state + cards, ~230KB): invisible in training (episodes end via
+  // _duel_end) but ~15MB per reset across a 64-slot pool under the turn-1
+  // search, which resets mid-episode by design. Reset() is the one safe
+  // destruction point: nothing can query the old duel after Reset begins.
+  bool duel_alive_ = false;
   // Value-initialized: Reset() and ~EDOProEnv() both delete non-null entries,
   // so indeterminate values here are a delete of garbage (crashes whenever the
   // object lands on recycled heap rather than fresh zeroed pages).
@@ -2079,6 +2087,19 @@ public:
     fdl_ = 0;
     chains_since_decision_ = 0;
     loop_cause_code_ = 0;
+    // Same class of bug, for multi-selects: an episode abandoned by a
+    // mid-episode reset() while ms_idx_ != -1 would make next() skip
+    // YGO_Process and re-present the DEAD duel's multi-select as the new
+    // episode's first decision (the ms_idx_ = -1 after next() below runs too
+    // late). The response then goes into the new duel: msg_retry at best, a
+    // "multi-select spec not found" abort at worst. Found by the turn-1
+    // search harness, which resets mid-episode by design.
+    ms_idx_ = -1;
+    ms_mode_ = 0;
+    ms_specs_.clear();
+    ms_combs_.clear();
+    ms_r_idxs_.clear();
+    ms_spec2idx_.clear();
     // positional specs from a previous duel would unhide unrelated cards
     revealed_.clear();
     revealed_owner_ = 255;
@@ -2114,7 +2135,11 @@ public:
     constexpr uint32_t drawcount = 1;
 
     std::unique_lock<std::shared_timed_mutex> ulock(duel_mtx);
+    if (duel_alive_) {
+      YGO_EndDuel(pduel_);
+    }
     auto opts = YGO_CreateDuel(duel_seed, init_lp, startcount, drawcount);
+    duel_alive_ = true;
     ulock.unlock();
 
     for (PlayerId i = 0; i < 2; i++) {
@@ -5940,6 +5965,7 @@ private:
 
     std::unique_lock<std::shared_timed_mutex> ulock(duel_mtx);
     YGO_EndDuel(pduel_);
+    duel_alive_ = false;
     ulock.unlock();
 
     duel_started_ = false;
