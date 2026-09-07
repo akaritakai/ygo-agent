@@ -57,7 +57,7 @@ class SyncEnvPool : public EnvPool<typename Env::Spec> {
         stepping_(0),
         sbq_(new StateBufferQueue(
             num_envs_, num_envs_, max_num_players_,
-            spec.state_spec.template AllValues<ShapeSpec>())),
+            spec.state_spec.template AllValues<ShapeSpec>(), /*sync_mode=*/true)),
         envs_(num_envs_) {
     if (max_num_players_ != 1) {
       throw std::runtime_error("SyncEnvPool supports single-player envs only");

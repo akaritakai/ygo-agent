@@ -45,9 +45,15 @@ class StateBufferQueue {
   std::atomic<bool> quit_;
 
  public:
+  // sync_mode: no background producer thread; Wait() allocates replacement buffers inline.
+  // Needed by SyncEnvPool, whose holding process is fork()ed for snapshots: the producer
+  // thread does not survive a fork, so a child would block forever once the pre-filled stock
+  // (six buffers) was consumed (found 2026-09-06 via bot/verify/verify_searches.py).
+  bool sync_mode_;
+
   StateBufferQueue(std::size_t batch_env, std::size_t num_envs,
                    std::size_t max_num_players,
-                   const std::vector<ShapeSpec>& specs)
+                   const std::vector<ShapeSpec>& specs, bool sync_mode = false)
       : batch_(batch_env),
         max_num_players_(max_num_players),
         is_player_state_(Transform(specs,
@@ -70,7 +76,8 @@ class StateBufferQueue {
         alloc_count_(0),
         done_ptr_(0),
         stock_buffer_((num_envs / batch_env + 2) * 2),
-        quit_(false) {
+        quit_(false),
+        sync_mode_(sync_mode) {
     // Only initialize first half of the buffer
     // At the consumption of each block, the first consumping thread
     // will allocate a new state buffer and append to the tail.
@@ -81,7 +88,7 @@ class StateBufferQueue {
     }
     std::size_t processor_count = std::thread::hardware_concurrency();
     // hardcode here :(
-    std::size_t create_buffer_thread_num = std::max(1UL, processor_count / 64);
+    std::size_t create_buffer_thread_num = sync_mode_ ? 0 : std::max(1UL, processor_count / 64);
     for (std::size_t i = 0; i < create_buffer_thread_num; ++i) {
       create_buffer_thread_.emplace_back(std::thread([&]() {
         while (true) {
@@ -137,7 +144,9 @@ class StateBufferQueue {
    * time of each state buffer is in the same order as the allocation time.
    */
   std::vector<Array> Wait(std::size_t additional_done_count = 0) {
-    std::unique_ptr<StateBuffer> newbuf = stock_buffer_.Get();
+    std::unique_ptr<StateBuffer> newbuf =
+        sync_mode_ ? std::make_unique<StateBuffer>(batch_, max_num_players_, specs_, is_player_state_)
+                   : stock_buffer_.Get();
     std::size_t pos = done_ptr_.fetch_add(1);
     std::size_t offset = pos % queue_size_;
     auto arr = queue_[offset]->Wait(additional_done_count);
