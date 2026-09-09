@@ -1862,6 +1862,39 @@ constexpr int kChTarget0 = 6;      // up to 3 target rows (1-based)
 constexpr int kChLinkIdx = 9;      // chain link number (1-based)
 constexpr int kChIsSpellTrap = 10; // the activating card is a Spell/Trap
 constexpr int kChNTargets = 11;    // total targets, including any beyond the 3 rows
+// h_events_ v2 columns — the public event stream as ONE SEAT would see it.
+// Two buffers are kept (one per seat) and a card's code is written only into
+// the buffers of the seats EDOPro's server would have sent it to; the event
+// itself (a card moved, a card was drawn) is public either way.
+constexpr int kEvType = 0;
+constexpr int kEvCode0 = 1;      // obs card id, 2 bytes; 0 when this seat may not see it
+constexpr int kEvCode1 = 2;
+constexpr int kEvPlayer = 3;     // 0 = this seat, 1 = the opponent
+constexpr int kEvLocFrom = 4;
+constexpr int kEvLocTo = 5;
+constexpr int kEvPosTo = 6;
+constexpr int kEvTurn = 7;       // absolute turn while stored, turn-delta in the observation
+constexpr int kEvPhase = 8;
+constexpr int kEvSeqTo = 9;
+constexpr int kEvReason = 10;    // destroy 1, banish 2, discard 4, summon 8, effect 16, battle 32, cost 64, material 128
+constexpr int kEvLink = 11;      // chain link number, for chain events
+constexpr int kEvEffectIdx = 12; // effect ordinal (chain) or action kind (decision)
+constexpr int kEvInstance = 13;  // instance tag (stage 7)
+// event types
+constexpr uint8_t kEvDecision = 1;      // a decision by this seat (2 = by the opponent)
+constexpr uint8_t kEvDecisionOpp = 2;
+constexpr uint8_t kEvMove = 3;
+constexpr uint8_t kEvSummon = 4;
+constexpr uint8_t kEvSpSummon = 5;
+constexpr uint8_t kEvFlipSummon = 6;
+constexpr uint8_t kEvSet = 7;
+constexpr uint8_t kEvChain = 8;
+constexpr uint8_t kEvDraw = 9;
+constexpr uint8_t kEvReveal = 10;
+constexpr uint8_t kEvPhaseChange = 11;
+constexpr uint8_t kEvAttack = 12;
+constexpr uint8_t kEvNewTurn = 13;
+constexpr uint8_t kEvVisBoth = 2;       // code_visible_to: 0 = P0 only, 1 = P1 only, 2 = public
 // actions_ v2 columns (0–11 are v1)
 constexpr int kAcPassCancel = 12;     // cancel 1, finish 2
 constexpr uint8_t kRuleSetId = 5;     // duel_options_ is DUEL_MODE_MR5 (a constant today)
@@ -2255,6 +2288,9 @@ protected:
   std::array<ankerl::unordered_dense::set<uint64_t>, 2> hopt_used_;
   std::array<ankerl::unordered_dense::set<uint64_t>, 2> hopt_used_duel_;
   std::array<ankerl::unordered_dense::map<uint32_t, uint8_t>, 2> activations_;
+  // per-seat public event history (circular, newest written at --head)
+  std::array<TArray<uint8_t>, 2> history_events_;
+  std::array<int, 2> he_p_{0, 0};
   // live chain stack, shadowed from MSG_CHAINING/CHAIN_SOLVED/CHAIN_END
   struct ChainLink {
     CardCode code = 0;
@@ -2345,6 +2381,10 @@ public:
         ShapeSpec(sizeof(uint8_t), {n_history_actions_, n_h_action_feats})));
     history_actions_1_ = TArray<uint8_t>(Array(
         ShapeSpec(sizeof(uint8_t), {n_history_actions_, n_h_action_feats})));
+    for (int p = 0; p < 2; ++p) {
+      history_events_[p] = TArray<uint8_t>(Array(
+          ShapeSpec(sizeof(uint8_t), {n_history_events_, kEventFeatsV2})));
+    }
   }
 
   ~EDOProEnv() {
@@ -2419,6 +2459,10 @@ public:
     reg_marks_ = reg_unmapped_ = reg_ambiguous_ = reg_proc_marks_ = 0;
     chain_stack_.clear();
     row_of_.clear();
+    for (int p = 0; p < 2; ++p) {
+      history_events_[p].Zero();
+      he_p_[p] = 0;
+    }
 
     history_actions_0_.Zero();
     history_actions_1_.Zero();
@@ -2668,6 +2712,58 @@ public:
     }
   }
 
+  // Append one public event to both seats' buffers. `owner` is the player the
+  // event is about (its "player" column is written relative to each seat);
+  // `code_visible_to` is 0/1 for a single seat or kEvVisBoth, and follows
+  // EDOPro's own masking (simulator/edopro/gframe/generic_duel.cpp).
+  void push_event(uint8_t type, CardCode code, uint8_t owner,
+                  uint8_t code_visible_to, uint8_t loc_from = 0,
+                  uint8_t loc_to = 0, uint8_t pos_to = 0, uint8_t seq_to = 0,
+                  uint8_t reason = 0, uint8_t link = 0, uint8_t effect_idx = 0,
+                  uint8_t instance = 0) {
+    if (obs_version_ < 2) {
+      return;
+    }
+    CardId cid = code == 0 ? 0 : c_get_card_id_or_zero(code);
+    for (uint8_t p = 0; p < 2; ++p) {
+      auto &buf = history_events_[p];
+      auto &head = he_p_[p];
+      head--;
+      if (head < 0) {
+        head = n_history_events_ - 1;
+      }
+      buf[head].Zero();
+      buf(head, kEvType) = type;
+      const bool may_see = code_visible_to == kEvVisBoth || code_visible_to == p;
+      if (may_see) {
+        buf(head, kEvCode0) = static_cast<uint8_t>(cid >> 8);
+        buf(head, kEvCode1) = static_cast<uint8_t>(cid & 0xff);
+      }
+      buf(head, kEvPlayer) = owner == p ? 0 : 1;
+      buf(head, kEvLocFrom) = loc_from;
+      buf(head, kEvLocTo) = loc_to;
+      buf(head, kEvPosTo) = pos_to;
+      buf(head, kEvTurn) = static_cast<uint8_t>(std::min(turn_count_, 255));
+      auto ph = phase2id.find(current_phase_);
+      buf(head, kEvPhase) = ph == phase2id.end() ? 0 : ph->second;
+      buf(head, kEvSeqTo) = seq_to;
+      buf(head, kEvReason) = reason;
+      buf(head, kEvLink) = link;
+      buf(head, kEvEffectIdx) = effect_idx;
+      buf(head, kEvInstance) = instance;
+    }
+  }
+  static uint8_t compress_reason(uint32_t reason) {
+    uint8_t r = 0;
+    if (reason & REASON_DESTROY) r |= 1;
+    if (reason & REASON_DISCARD) r |= 4;
+    if (reason & REASON_SUMMON) r |= 8;
+    if (reason & REASON_EFFECT) r |= 16;
+    if (reason & REASON_BATTLE) r |= 32;
+    if (reason & REASON_COST) r |= 64;
+    if (reason & REASON_MATERIAL) r |= 128;
+    return r;
+  }
   int row_for(const loc_info &li) const {
     auto it = row_of_.find(obs_row_key(li.controler, li.location, li.sequence));
     return it == row_of_.end() ? 0 : it->second;
@@ -2735,6 +2831,27 @@ public:
     history_actions[ha_p](0) = 0;
     history_actions[ha_p](12) = static_cast<uint8_t>(std::min(turn_count_, 255));
     history_actions[ha_p](13) = phase2id.at(current_phase_);
+    // The same decision, in the unified event stream (obs v2). THE CHOSEN
+    // CARD'S IDENTITY IS WRITTEN FOR THE ACTING SEAT ONLY: "which card of my
+    // hand did the opponent Set" is exactly what the client never learns, and
+    // an early version of this leaked it (caught by puzzle 17). The opponent
+    // still sees that a decision happened, of what kind, when — and sees the
+    // consequences through the move / summon / chain events, each masked by
+    // EDOPro's own rules.
+    push_event(kEvDecision, 0, player, kEvVisBoth, 0, 0, 0, 0, 0, 0,
+               static_cast<uint8_t>(action.act_));
+    if (obs_version_ >= 2) {
+      for (uint8_t p = 0; p < 2; ++p) {
+        auto &buf = history_events_[p];
+        int head = he_p_[p];
+        if (p != player) {
+          buf(head, kEvType) = kEvDecisionOpp;
+          continue;
+        }
+        buf(head, kEvCode0) = static_cast<uint8_t>(action.cid_ >> 8);
+        buf(head, kEvCode1) = static_cast<uint8_t>(action.cid_ & 0xff);
+      }
+    }
   }
 
   void show_deck(const std::vector<CardCode> &deck, const std::string &prefix) const {
@@ -3559,6 +3676,24 @@ private:
         const auto &a = legal_actions_[i];
         state["obs:actions_"_](i, kAcPassCancel) = static_cast<uint8_t>(
             (a.act_ == ActionAct::Cancel ? 1 : 0) | (a.finish_ ? 2 : 0));
+      }
+    }
+
+    if (obs_version_ >= 2) {
+      const auto &events = history_events_[to_play_];
+      const int hp = he_p_[to_play_];
+      const int tail = n_history_events_ - hp;
+      state["obs:h_events_"_].Assign((uint8_t *)events[hp].Data(),
+                                     kEventFeatsV2 * tail);
+      state["obs:h_events_"_][tail].Assign((uint8_t *)events.Data(),
+                                           kEventFeatsV2 * hp);
+      for (int i = 0; i < n_history_events_; ++i) {
+        if (uint8_t(state["obs:h_events_"_](i, kEvType)) == 0) {
+          break;   // unused rows are zero; the newest is row 0
+        }
+        int turn_diff = std::min(
+            32, turn_count_ - int(uint8_t(state["obs:h_events_"_](i, kEvTurn))));
+        state["obs:h_events_"_](i, kEvTurn) = static_cast<uint8_t>(std::max(turn_diff, 0));
       }
     }
 
@@ -4442,18 +4577,23 @@ private:
     }
 
     if (msg_ == MSG_DRAW) {
-      if (!verbose_) {
-        dp_ = dl_;
-        return;
-      }
       auto player = read_u8();
       // TODO: different with ygopro-core
       auto drawed = compat_read<uint8_t, uint32_t>();
       std::vector<uint32_t> codes;
       for (int i = 0; i < drawed; ++i) {
         uint32_t code = read_u32();
-        dp_ += 4;
+        uint32_t pos = read_u32();
         codes.push_back(code & 0x7fffffff);
+        // EDOPro's server blanks a drawn card's code for the other seat
+        // unless the draw is face-up (public knowledge)
+        push_event(kEvDraw, codes.back(), player,
+                   (pos & POS_FACEUP) ? kEvVisBoth : player, LOCATION_DECK,
+                   LOCATION_HAND);
+      }
+      if (!verbose_) {
+        dp_ = dl_;
+        return;
       }
       const auto &pl = players_[player];
       pl->notify(fmt::format("Drew {} cards:", drawed));
@@ -4472,6 +4612,7 @@ private:
         hopt_used_[p].clear();
         activations_[p].clear();
       }
+      push_event(kEvNewTurn, 0, static_cast<uint8_t>(tp_), kEvVisBoth);
       revealed_.clear();
       revealed_owner_ = 255;
       revealed_hand_n_ = -1;
@@ -4483,6 +4624,7 @@ private:
       players_[1 - tp_]->notify(fmt::format("{}'s turn.", player->nickname_));
     } else if (msg_ == MSG_NEW_PHASE) {
       current_phase_ = int(read_u16());
+      push_event(kEvPhaseChange, 0, static_cast<uint8_t>(tp_), kEvVisBoth);
       if (!verbose_) {
         return;
       }
@@ -4491,14 +4633,30 @@ private:
         players_[i]->notify(fmt::format("Entering {} phase.", phase_str));
       }
     } else if (msg_ == MSG_MOVE) {
-      if (!verbose_) {
-        dp_ = dl_;
-        return;
-      }
       CardCode code = read_u32();
       loc_info location = read_loc_info();
       loc_info newloc = read_loc_info();
       uint32_t reason = read_u32();
+      if (obs_version_ >= 2) {
+        // EDOPro's server hides the code from the other seat when the card
+        // lands in the deck or hand, or lands face-down — unless it is in the
+        // graveyard or an overlay pile, which are public.
+        const bool hidden =
+            !(newloc.location & (LOCATION_GRAVE | LOCATION_OVERLAY)) &&
+            ((newloc.location & (LOCATION_DECK | LOCATION_HAND)) ||
+             (newloc.position & POS_FACEDOWN));
+        push_event(kEvMove, code, newloc.controler,
+                   hidden ? newloc.controler : kEvVisBoth,
+                   static_cast<uint8_t>(location.location),
+                   static_cast<uint8_t>(newloc.location),
+                   static_cast<uint8_t>(newloc.position),
+                   static_cast<uint8_t>(std::min<uint32_t>(newloc.sequence, 255)),
+                   compress_reason(reason));
+      }
+      if (!verbose_) {
+        dp_ = dl_;
+        return;
+      }
       Card card = c_get_card(code);
       card.set_location(location);
       Card cnew = c_get_card(code);
@@ -4647,6 +4805,11 @@ private:
       if (card.location_ & LOCATION_MZONE) {
         ++normal_summons_this_turn_;  // a monster Set spends the Normal Summon
       }
+      // EDOPro zeroes the code for everyone; the setting player knows it, and
+      // this seat already sees its own face-down identities in cards_
+      push_event(kEvSet, code, card.controler_, card.controler_, 0,
+                 static_cast<uint8_t>(card.location_), POS_FACEDOWN,
+                 static_cast<uint8_t>(std::min<uint32_t>(card.sequence_, 255)));
       if (!verbose_) {
         dp_ = dl_;
         return;
@@ -4907,6 +5070,12 @@ private:
         // "oh2" via get_spec(opponent). They could never match: the reveal
         // mechanism has never surfaced anything in the observation.
         revealed_.push_back(ls_to_spec(loc, seq, 0, c != player));
+        // cards shown from the deck or Extra Deck are shown only to `player`
+        // (EDOPro sends that packet to one seat); anything else is public
+        push_event(kEvReveal, get_card_code(c, loc, static_cast<uint8_t>(seq)), c,
+                   (loc & (LOCATION_DECK | LOCATION_EXTRA)) ? player : kEvVisBoth,
+                   static_cast<uint8_t>(loc), static_cast<uint8_t>(loc), 0,
+                   static_cast<uint8_t>(std::min<uint32_t>(seq, 255)));
         if (std::getenv("YGOENV_REVEAL_DEBUG")) {
           fmt::print(stderr, "[reveal] to=P{} owner=P{} loc={} seq={} spec={}\n",
                      int(player), int(c), int(loc), int(seq),
@@ -5103,6 +5272,10 @@ private:
       CardCode code = read_u32();
       loc_info sloc = read_loc_info();
       register_proc_summon(code, sloc.controler, false);
+      push_event(kEvSummon, code, sloc.controler, kEvVisBoth, 0,
+                 static_cast<uint8_t>(sloc.location),
+                 static_cast<uint8_t>(sloc.position),
+                 static_cast<uint8_t>(std::min<uint32_t>(sloc.sequence, 255)));
       if (!verbose_) {
         dp_ = dl_;
         return;
@@ -5121,13 +5294,17 @@ private:
     } else if (msg_ == MSG_FLIPSUMMONED) {
       dp_ = dl_;
     } else if (msg_ == MSG_FLIPSUMMONING) {
+      auto code = read_u32();
+      auto loc_info = read_loc_info();
+      // a Flip Summon turns the card face-up: public to both seats
+      push_event(kEvFlipSummon, code, loc_info.controler, kEvVisBoth, 0,
+                 static_cast<uint8_t>(loc_info.location),
+                 static_cast<uint8_t>(loc_info.position),
+                 static_cast<uint8_t>(std::min<uint32_t>(loc_info.sequence, 255)));
       if (!verbose_) {
         dp_ = dl_;
         return;
       }
-
-      auto code = read_u32();
-      auto loc_info = read_loc_info();
       Card card = c_get_card(code);
       card.set_location(loc_info);
 
@@ -5147,6 +5324,12 @@ private:
         if ((reason & REASON_EFFECT) == 0) {
           register_proc_summon(code, sloc.controler, true);
         }
+        // face-down Special Summons keep their code from the other seat
+        push_event(kEvSpSummon, code, sloc.controler,
+                   (sloc.position & POS_FACEDOWN) ? sloc.controler : kEvVisBoth,
+                   0, static_cast<uint8_t>(sloc.location),
+                   static_cast<uint8_t>(sloc.position),
+                   static_cast<uint8_t>(std::min<uint32_t>(sloc.sequence, 255)));
       }
       if (!verbose_) {
         dp_ = dl_;
@@ -5230,6 +5413,19 @@ private:
         link.desc = desc;
         link.spell_trap = (card.type_ & (TYPE_SPELL | TYPE_TRAP)) != 0;
         chain_stack_.push_back(link);
+        uint8_t ordinal = 0;
+        if (effect_table_.loaded) {
+          auto it = effect_table_.chain.find(
+              EffectTable::chain_key(canonical_code(code), desc));
+          if (it != effect_table_.chain.end()) ordinal = it->second.idx;
+        }
+        // an activation is public: both seats see the card and its effect
+        push_event(kEvChain, code, card.controler_, kEvVisBoth,
+                   static_cast<uint8_t>(card.location_),
+                   static_cast<uint8_t>(card.location_),
+                   static_cast<uint8_t>(card.position_),
+                   static_cast<uint8_t>(std::min<uint32_t>(card.sequence_, 255)),
+                   0, link.chain_count, ordinal);
       }
       if (!verbose_) {
         dp_ = dl_;
@@ -5274,10 +5470,17 @@ private:
     } else if (msg_ == MSG_ATTACK) {
       ++attacks_this_turn_;
       if (!verbose_) {
+        auto a = read_loc_info();
+        push_event(kEvAttack, 0, a.controler, kEvVisBoth, 0,
+                   static_cast<uint8_t>(a.location), 0,
+                   static_cast<uint8_t>(std::min<uint32_t>(a.sequence, 255)));
         dp_ = dl_;
         return;
       }
       auto attacker = read_loc_info();
+      push_event(kEvAttack, 0, attacker.controler, kEvVisBoth, 0,
+                 static_cast<uint8_t>(attacker.location), 0,
+                 static_cast<uint8_t>(std::min<uint32_t>(attacker.sequence, 255)));
       PlayerId ac = attacker.controler;
       auto aloc = attacker.location;
       auto aseq = attacker.sequence;
