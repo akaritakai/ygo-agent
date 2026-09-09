@@ -1816,7 +1816,7 @@ public:
 // cards_ columns 0–40 are the v1 layout byte for byte (printed attribute /
 // race / type stay in their v1 columns); v2 appends live values and flags so
 // every v1 reader keeps working and a parity test can assert the superset.
-constexpr int kCardFeatsV2 = 56;
+constexpr int kCardFeatsV2 = 64;
 constexpr int kGlobalFeatsV2 = 40;
 constexpr int kActionFeatsV2 = 16;
 constexpr int kEventFeatsV2 = 16;
@@ -1837,8 +1837,13 @@ constexpr int kCcRScale = 49;
 constexpr int kCcLiveAttribute = 50;
 constexpr int kCcLiveRace = 51;
 constexpr int kCcLiveType0 = 52;      // 4 bytes: the 25 type bits in type2str order
-// 56–63 reserved; the chain-link column rides in the last live-type byte's slot
 constexpr int kCcOnChainLink = 55;    // chain link number this card is activating; 0 none
+// Per-duel instance tag: lets a history row and a card row name the SAME card
+// across zone changes. Assigned only in PUBLIC zones (field / GY / banished /
+// overlay) and dropped when a card enters a hidden one, so it can never become
+// a channel for tracking a card through an opponent's hand or deck.
+constexpr int kCcInstance = 56;
+// 57–63 reserved
 // global_ v2 columns (0–22 are v1)
 constexpr int kGcNormalSummons = 23;  // Normal Summons / Sets this turn
 constexpr int kGcAttacks = 24;        // attacks declared this turn
@@ -2288,6 +2293,9 @@ protected:
   std::array<ankerl::unordered_dense::set<uint64_t>, 2> hopt_used_;
   std::array<ankerl::unordered_dense::set<uint64_t>, 2> hopt_used_duel_;
   std::array<ankerl::unordered_dense::map<uint32_t, uint8_t>, 2> activations_;
+  // MSG_ANNOUNCE_CARD: bitset over the code list of declarable ids (obs v2)
+  std::vector<uint8_t> announce_mask_;
+  int announce_candidates_ = 0;
   // per-seat public event history (circular, newest written at --head)
   std::array<TArray<uint8_t>, 2> history_events_;
   std::array<int, 2> he_p_{0, 0};
@@ -2306,6 +2314,9 @@ protected:
   std::vector<ChainLink> chain_stack_;
   // (controler, location, sequence) -> 1-based cards_ row, rebuilt every WriteState
   ankerl::unordered_dense::map<uint32_t, int> row_of_;
+  // (controler, location, sequence) -> per-duel instance tag, public zones only
+  ankerl::unordered_dense::map<uint32_t, uint8_t> instance_tag_;
+  uint8_t next_instance_tag_ = 1;
   // branch counters (printed at episode end when non-zero under verbose)
   int reg_marks_ = 0;            // activations mapped to a group
   int reg_unmapped_ = 0;         // activations with no table entry
@@ -2463,6 +2474,10 @@ public:
       history_events_[p].Zero();
       he_p_[p] = 0;
     }
+    instance_tag_.clear();
+    next_instance_tag_ = 1;
+    announce_mask_.clear();
+    announce_candidates_ = 0;
 
     history_actions_0_.Zero();
     history_actions_1_.Zero();
@@ -2751,6 +2766,43 @@ public:
       buf(head, kEvLink) = link;
       buf(head, kEvEffectIdx) = effect_idx;
       buf(head, kEvInstance) = instance;
+    }
+  }
+  static bool public_zone(uint8_t location) {
+    const uint8_t loc = location & 0x7f;
+    return (loc & (LOCATION_MZONE | LOCATION_SZONE | LOCATION_GRAVE |
+                   LOCATION_REMOVED)) != 0 ||
+           (location & LOCATION_OVERLAY) != 0;
+  }
+  uint8_t instance_tag_for(uint8_t controler, uint8_t location, uint32_t seq) {
+    if (!public_zone(location)) {
+      return 0;
+    }
+    uint32_t key = obs_row_key(controler, location, seq);
+    auto it = instance_tag_.find(key);
+    if (it != instance_tag_.end()) {
+      return it->second;
+    }
+    uint8_t tag = next_instance_tag_++;
+    if (next_instance_tag_ == 0) next_instance_tag_ = 1;   // 0 means "none"
+    instance_tag_[key] = tag;
+    return tag;
+  }
+  // A card that moves takes its tag along; one that enters a hidden zone loses it.
+  void move_instance_tag(const loc_info &from, const loc_info &to) {
+    uint32_t from_key = obs_row_key(from.controler, from.location, from.sequence);
+    auto it = instance_tag_.find(from_key);
+    uint8_t tag = it == instance_tag_.end() ? 0 : it->second;
+    if (it != instance_tag_.end()) {
+      instance_tag_.erase(it);
+    }
+    if (public_zone(to.location)) {
+      uint32_t to_key = obs_row_key(to.controler, to.location, to.sequence);
+      if (tag == 0) {
+        tag = next_instance_tag_++;
+        if (next_instance_tag_ == 0) next_instance_tag_ = 1;
+      }
+      instance_tag_[to_key] = tag;
     }
   }
   static uint8_t compress_reason(uint32_t reason) {
@@ -3217,6 +3269,12 @@ private:
     if (overlay) {
       f(row, kCcAttachKind) = 1;     // host row resolved by _set_obs_cards
     }
+    // A face-down monster is a PUBLIC OBJECT with a hidden identity: everyone
+    // sees that a card sits in that zone, so it gets an instance tag like any
+    // other public card. The tag is written before the identity check for
+    // exactly that reason.
+    f(row, kCcInstance) =
+        instance_tag_for(c.controler_, static_cast<uint8_t>(c.location_), c.sequence_);
     if (hide) {
       return;
     }
@@ -3669,6 +3727,10 @@ private:
     }
 
     _set_obs_actions(state["obs:actions_"_], legal_actions_);
+    if (obs_version_ >= 2 && msg_ == MSG_ANNOUNCE_CARD && !announce_mask_.empty()) {
+      state["obs:announce_mask_"_].Assign(announce_mask_.data(),
+                                          kAnnounceMaskBytesV2);
+    }
     if (obs_version_ >= 2) {
       state["obs:global_"_][kGcNActions] =
           static_cast<uint8_t>(std::min(n_options, 255));
@@ -4645,13 +4707,17 @@ private:
             !(newloc.location & (LOCATION_GRAVE | LOCATION_OVERLAY)) &&
             ((newloc.location & (LOCATION_DECK | LOCATION_HAND)) ||
              (newloc.position & POS_FACEDOWN));
+        move_instance_tag(location, newloc);
         push_event(kEvMove, code, newloc.controler,
                    hidden ? newloc.controler : kEvVisBoth,
                    static_cast<uint8_t>(location.location),
                    static_cast<uint8_t>(newloc.location),
                    static_cast<uint8_t>(newloc.position),
                    static_cast<uint8_t>(std::min<uint32_t>(newloc.sequence, 255)),
-                   compress_reason(reason));
+                   compress_reason(reason), 0, 0,
+                   instance_tag_for(newloc.controler,
+                                    static_cast<uint8_t>(newloc.location),
+                                    newloc.sequence));
       }
       if (!verbose_) {
         dp_ = dl_;
@@ -6807,6 +6873,29 @@ private:
         throw std::runtime_error("No declarable cards for announce card");
       }
       std::sort(candidates.begin(), candidates.end());
+      if (obs_version_ >= 2) {
+        // The declarable set can run to five figures, so it is carried as a
+        // BITSET over the format code list (one bit per obs card id) instead
+        // of as option rows. The option list below stays the action surface
+        // until the announce head lands with codec v2 (11 P3-01): it is the
+        // one message obs v2 still clips, and the clip is counted here.
+        announce_mask_.assign(kAnnounceMaskBytesV2, 0);
+        int in_list = 0;
+        for (CardCode c : candidates) {
+          CardId cid = c_get_card_id_or_zero(c);
+          if (cid == 0) continue;
+          size_t byte = cid >> 3;
+          if (byte < announce_mask_.size()) {
+            announce_mask_[byte] |= static_cast<uint8_t>(1u << (cid & 7));
+            ++in_list;
+          }
+        }
+        announce_candidates_ = static_cast<int>(candidates.size());
+        if (announce_candidates_ > max_options()) {
+          fmt::print(stderr, "[announceclip] declarable={} in_code_list={} max_options={}\n",
+                     announce_candidates_, in_list, max_options());
+        }
+      }
       for (const auto &code : candidates) {
         LegalAction la;
         la.cid_ = c_get_card_id_or_zero(code);
