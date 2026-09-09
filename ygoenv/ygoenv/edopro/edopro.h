@@ -3,6 +3,7 @@
 
 // clang-format off
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdio>
 #include <numeric>
@@ -672,6 +673,19 @@ inline std::vector<uint8_t> type_to_ids(uint32_t type) {
   return ids;
 }
 
+// Live values can carry combinations no table row names (obs v2 features,
+// never lookups that may throw).
+inline uint8_t attribute_to_id_safe(uint32_t a) {
+  if (a > 0xff) return 0;
+  auto it = attribute2id.find(static_cast<uint8_t>(a));
+  return it == attribute2id.end() ? 0 : it->second;
+}
+inline uint8_t race_to_id_safe(uint64_t r) {
+  if (r > 0xffffffffull) return 0;
+  auto it = race2id.find(static_cast<uint32_t>(r));
+  return it == race2id.end() ? 0 : it->second;
+}
+
 static const std::map<int, std::string> phase2str = {
     {PHASE_DRAW, "draw phase"},
     {PHASE_STANDBY, "standby phase"},
@@ -1061,6 +1075,21 @@ protected:
   uint32_t position_ = 0;
   uint32_t counter_ = 0;
   uint32_t status_ = 0;
+
+  // Observation v2: live values from the query (effects change type /
+  // attribute / race; the CDB fields above stay the printed values), the
+  // core's original ATK/DEF, owner, attachment edges and the core's own
+  // "identity is public" verdict.
+  uint32_t type_live_ = 0;
+  uint32_t attribute_live_ = 0;
+  uint64_t race_live_ = 0;
+  int32_t base_attack_ = 0;
+  int32_t base_defense_ = 0;
+  uint8_t owner_ = 255;
+  bool has_equip_target_ = false;
+  loc_info equip_target_{};
+  std::vector<loc_info> target_cards_;
+  uint8_t is_public_ = 0;
 
 public:
   Card() = default;
@@ -1773,6 +1802,52 @@ public:
   }
 };
 
+// ---- Observation v2 layout (notes/10 §4, v2.1) ----
+// cards_ columns 0–40 are the v1 layout byte for byte (printed attribute /
+// race / type stay in their v1 columns); v2 appends live values and flags so
+// every v1 reader keeps working and a parity test can assert the superset.
+constexpr int kCardFeatsV2 = 56;
+constexpr int kGlobalFeatsV2 = 40;
+constexpr int kActionFeatsV2 = 16;
+constexpr int kEventFeatsV2 = 16;
+constexpr int kChainRowsV2 = 8;
+constexpr int kChainFeatsV2 = 12;
+constexpr int kAnnounceMaskBytesV2 = 2048;  // 16,384 code-list ids
+constexpr int kMinOptionsV2 = 128;          // deck-wide select_card lists exceed 64
+// cards_ v2 columns
+constexpr int kCcHostRow = 41;        // 1-based row of the host card; 0 none
+constexpr int kCcAttachKind = 42;     // 0 none, 1 xyz material, 2 equip, 3 continuous target
+constexpr int kCcDiffers = 43;        // level 1, atk 2, def 4, attribute 8, race 16, type 32, owner≠controller 64
+constexpr int kCcStatus = 44;         // disabled 1, forbidden 2, summon-turn 4, spsummon-turn 8, set-turn 16, flip-summon-turn 32, attack-canceled 64, form-changed 128
+constexpr int kCcHoptUsed = 45;       // hard-OPT groups used this turn (bit per group ordinal), stage 3
+constexpr int kCcActivations = 46;    // activations of this name this turn (clamp 15) | soft-OPT bits, stage 3
+constexpr int kCcKnowledge = 47;      // known-to-me 1, public 2, revealed-this-turn 4, own-face-down 8, on-chain 16, targeted 32
+constexpr int kCcLScale = 48;
+constexpr int kCcRScale = 49;
+constexpr int kCcLiveAttribute = 50;
+constexpr int kCcLiveRace = 51;
+constexpr int kCcLiveType0 = 52;      // 4 bytes: the 25 type bits in type2str order
+// global_ v2 columns (0–22 are v1)
+constexpr int kGcNormalSummons = 23;  // Normal Summons / Sets this turn
+constexpr int kGcAttacks = 24;        // attacks declared this turn
+constexpr int kGcChainLen = 25;       // live chain length, stage 4
+constexpr int kGcMsg = 26;            // current decision message id (msg2id)
+constexpr int kGcSelMin = 27;
+constexpr int kGcSelMax = 28;
+constexpr int kGcSelFlags = 29;       // multi-select in progress 1, prefix-filtered mode 2
+constexpr int kGcNActions = 30;
+constexpr int kGcRuleSet = 31;        // Master Rule era the duel was created under
+constexpr int kGcObsVersion = 32;
+constexpr int kGcOverflow0 = 33;      // 7 per-location counts of rows dropped by the row budget
+// actions_ v2 columns (0–11 are v1)
+constexpr int kAcPassCancel = 12;     // cancel 1, finish 2
+constexpr uint8_t kRuleSetId = 5;     // duel_options_ is DUEL_MODE_MR5 (a constant today)
+
+inline uint32_t obs_row_key(uint8_t controler, uint8_t location, uint32_t sequence) {
+  return (uint32_t(controler) << 24) | (uint32_t(location & 0x7f) << 16) |
+         (sequence & 0xffff);
+}
+
 class EDOProEnvFns {
 public:
   static decltype(auto) DefaultConfig() {
@@ -1804,20 +1879,37 @@ public:
                     // behaviour (the upstream trainer always passes it).
                     "async_reset"_.Bind(false), "greedy_reward"_.Bind(true),
                     "timeout"_.Bind(600), "oppo_info"_.Bind(false),
-                    "max_steps"_.Bind(0));
+                    "max_steps"_.Bind(0),
+                    // Observation v2 (notes/10 §4, v2.1): a superset layout
+                    // selected by obs_version=2; every v1 array stays
+                    // byte-identical under the default. n_history_events sizes
+                    // h_events_; effect_table_file feeds the OPT registers.
+                    "obs_version"_.Bind(1), "n_history_events"_.Bind(128),
+                    "effect_table_file"_.Bind(std::string("")));
   }
   template <typename Config>
   static decltype(auto) StateSpec(const Config &conf) {
     // ygopro layout (D4): 12 typed action features; history rows add
     // turn-diff and phase columns.
     int n_action_feats = 12;
+    const int obs_v = conf["obs_version"_];
+    const int n_card_feats = obs_v >= 2 ? kCardFeatsV2 : 41;
+    const int n_global_feats = obs_v >= 2 ? kGlobalFeatsV2 : 23;
+    const int n_action_feats_v = obs_v >= 2 ? kActionFeatsV2 : n_action_feats;
     return MakeDict(
-        "obs:cards_"_.Bind(Spec<uint8_t>({conf["max_cards"_] * 2, 41})),
-        "obs:global_"_.Bind(Spec<uint8_t>({23})),
+        "obs:cards_"_.Bind(
+            Spec<uint8_t>({conf["max_cards"_] * 2, n_card_feats})),
+        "obs:global_"_.Bind(Spec<uint8_t>({n_global_feats})),
         "obs:actions_"_.Bind(
-            Spec<uint8_t>({conf["max_options"_], n_action_feats})),
+            Spec<uint8_t>({conf["max_options"_], n_action_feats_v})),
         "obs:h_actions_"_.Bind(
             Spec<uint8_t>({conf["n_history_actions"_], n_action_feats + 2})),
+        // v2 arrays (all-zero under obs_version=1): public-event history,
+        // the live chain stack, and the announce bitset over the code list.
+        "obs:h_events_"_.Bind(
+            Spec<uint8_t>({conf["n_history_events"_], kEventFeatsV2})),
+        "obs:chain_"_.Bind(Spec<uint8_t>({kChainRowsV2, kChainFeatsV2})),
+        "obs:announce_mask_"_.Bind(Spec<uint8_t>({kAnnounceMaskBytesV2})),
         "obs:mask_"_.Bind(Spec<uint8_t>({conf["max_cards"_] * 2, 14})),
         "info:num_options"_.Bind(Spec<int>({}, std::tuple<int, int>{0, conf["max_options"_] - 1})),
         "info:to_play"_.Bind(Spec<int>({}, std::tuple<int, int>{0, 1})),
@@ -1975,7 +2067,11 @@ protected:
   int dl_ = 0;
   int fdl_ = 0;
 
-  uint8_t query_buf_[16384];
+  // Obs v2 adds type / attribute / race / base stats / owner / targets to the
+  // location query (~70 bytes per card); a 60-card location then approaches
+  // 16 KB, so the buffer is 64 KB and the copy is guarded (see the query shims).
+  static constexpr size_t kQueryBufSize = 65536;
+  uint8_t query_buf_[kQueryBufSize];
   int qdp_ = 0;
 
   uint8_t resp_buf_[128];
@@ -2002,6 +2098,15 @@ protected:
   // circular buffer for history actions of player 1
   TArray<uint8_t> history_actions_1_;
   int ha_p_1_ = 0;
+
+  // ---- observation v2 state (notes/10 §4) ----
+  const int obs_version_;
+  const int n_history_events_;
+  // per-turn counters shadowed from the message stream (client-visible)
+  int normal_summons_this_turn_ = 0;
+  int attacks_this_turn_ = 0;
+  // rows dropped by the row budget, per loc_n_cards index (7 me + 7 opp)
+  std::array<int, 14> row_overflow_{};
 
   // Cards of the opponent's hand that this seat has legitimately SEEN (e.g.
   // "Kewl Tune Rotary": "Look at your opponent's hand"). This is public
@@ -2042,8 +2147,21 @@ public:
         player_(spec.config["player"_]),
         play_modes_(parse_play_modes(spec.config["play_mode"_])),
         verbose_(spec.config["verbose"_]), record_(spec.config["record"_]),
-        n_history_actions_(spec.config["n_history_actions"_]) {
+        n_history_actions_(spec.config["n_history_actions"_]),
+        obs_version_(spec.config["obs_version"_]),
+        n_history_events_(spec.config["n_history_events"_]) {
     greedy_reward_ = spec.config["greedy_reward"_];
+    if (obs_version_ >= 2 && spec.config["max_cards"_] * 2 > 255) {
+      throw std::runtime_error(
+          "obs_version=2 needs max_cards*2 <= 255 (host rows are one byte)");
+    }
+    if (obs_version_ >= 2 && int(spec.config["max_options"_]) < kMinOptionsV2) {
+      // measured 2026-09-08: a select_card over a whole deck offers 65
+      // candidates under random play; v2 never clips, so size for it.
+      throw std::runtime_error(fmt::format(
+          "obs_version=2 needs max_options >= {} (got {})", kMinOptionsV2,
+          int(spec.config["max_options"_])));
+    }
     if (record_) {
       if (!verbose_) {
         throw std::runtime_error("record mode must be used with verbose mode and num_envs=1");
@@ -2119,6 +2237,9 @@ public:
     }
 
     turn_count_ = 0;
+    normal_summons_this_turn_ = 0;
+    attacks_this_turn_ = 0;
+    row_overflow_.fill(0);
 
     history_actions_0_.Zero();
     history_actions_1_.Zero();
@@ -2446,6 +2567,17 @@ private:
     std::vector<int> loc_n_cards;
     const int max_rows = spec_.config["max_cards"_] * 2;
     int offset = 0;
+    row_overflow_.fill(0);
+    // obs v2: attachment edges (xyz host, equip target, continuous target)
+    // need the host's row, which may be written after the attached card's;
+    // collect and resolve after the pass.
+    struct PendingEdge {
+      int row;
+      uint8_t kind;
+      loc_info target;
+    };
+    ankerl::unordered_dense::map<uint32_t, int> row_of;
+    std::vector<PendingEdge> pending;
     for (auto pi = 0; pi < 2; pi++) {
       const PlayerId player = (to_play + pi) % 2;
       const bool opponent = pi == 1;
@@ -2472,6 +2604,7 @@ private:
           loc_n_cards.push_back(n_cards);
           for (auto i = 0; i < n_cards; i++) {
             if (offset >= max_rows) {
+              row_overflow_[loc_n_cards.size() - 1] += n_cards - i;
               break;
             }
             f_cards(offset, 2) = location2id.at(location);
@@ -2483,6 +2616,7 @@ private:
           loc_n_cards.push_back(cards.size());
           for (int i = 0; i < cards.size(); ++i) {
             if (offset >= max_rows) {
+              row_overflow_[loc_n_cards.size() - 1] += int(cards.size()) - i;
               break;
             }
             const auto &c = cards[i];
@@ -2502,9 +2636,36 @@ private:
               card_id = c_get_card_id_or_zero(c.code_);
             }
             _set_obs_card_(f_cards, offset, c, hide);
+            if (obs_version_ >= 2) {
+              const bool overlay = c.location_ & LOCATION_OVERLAY;
+              if (!overlay) {
+                row_of[obs_row_key(c.controler_, c.location_, c.sequence_)] =
+                    offset + 1;
+                if (!hide && c.has_equip_target_) {
+                  pending.push_back({offset, 2, c.equip_target_});
+                } else if (!hide && !c.target_cards_.empty()) {
+                  pending.push_back({offset, 3, c.target_cards_[0]});
+                }
+              } else {
+                loc_info host{c.controler_,
+                              static_cast<uint8_t>(c.location_ & 0x7f),
+                              c.sequence_, 0};
+                pending.push_back({offset, 1, host});
+              }
+            }
             offset++;
             spec_infos[spec] = {static_cast<uint16_t>(offset), card_id};
           }
+        }
+      }
+    }
+    if (obs_version_ >= 2) {
+      for (const auto &p : pending) {
+        auto it = row_of.find(obs_row_key(p.target.controler, p.target.location,
+                                          p.target.sequence));
+        if (it != row_of.end()) {
+          f_cards(p.row, kCcHostRow) = static_cast<uint8_t>(it->second);
+          f_cards(p.row, kCcAttachKind) = p.kind;
         }
       }
     }
@@ -2595,6 +2756,65 @@ private:
         f_cards(offset, 16 + j) = type_ids[j];
       }
     }
+    if (obs_version_ >= 2) {
+      _set_obs_card_v2_(f_cards, offset, c, hide, overlay);
+    }
+  }
+
+  // Obs v2 columns 41+ (notes/10 §4.1). Columns 0–40 are v1, untouched.
+  void _set_obs_card_v2_(TArray<uint8_t> &f, int row, const Card &c, bool hide,
+                         bool overlay) {
+    uint8_t know = 0;
+    if (!hide) know |= 1;            // identity known to this seat
+    if (c.is_public_) know |= 2;     // core: face-up, chain-related, or EFFECT_PUBLIC
+    const bool mine = c.controler_ == to_play_;
+    const uint8_t loc = static_cast<uint8_t>(c.location_ & 0x7f);
+    if (mine && !overlay && (c.position_ & POS_FACEDOWN)) know |= 8;
+    if (!mine && loc == LOCATION_HAND && !revealed_.empty() &&
+        revealed_owner_ == c.controler_) {
+      auto spec = c.get_spec(true);
+      if (std::find(revealed_.begin(), revealed_.end(), spec) != revealed_.end()) {
+        know |= 4;                   // revealed this turn
+      }
+    }
+    f(row, kCcKnowledge) = know;
+    if (overlay) {
+      f(row, kCcAttachKind) = 1;     // host row resolved by _set_obs_cards
+    }
+    if (hide) {
+      return;
+    }
+    const Card &printed = c_get_card(c.code_);
+    uint8_t differs = 0;
+    if ((c.level_ & 0xff) != (printed.level_ & 0xff)) differs |= 1;
+    if (c.attack_ != printed.attack_) differs |= 2;
+    // links keep their markers in defense_ (pre-existing convention)
+    if (!(c.type_ & TYPE_LINK) && c.defense_ != printed.defense_) differs |= 4;
+    if (c.attribute_live_ != printed.attribute_) differs |= 8;
+    if (c.race_live_ != printed.race_) differs |= 16;
+    if (c.type_live_ != printed.type_) differs |= 32;
+    if (c.owner_ != 255 && c.owner_ != c.controler_) differs |= 64;
+    f(row, kCcDiffers) = differs;
+    uint8_t st = 0;
+    if (c.status_ & STATUS_DISABLED) st |= 1;
+    if (c.status_ & STATUS_FORBIDDEN) st |= 2;
+    if (c.status_ & STATUS_SUMMON_TURN) st |= 4;
+    if (c.status_ & STATUS_SPSUMMON_TURN) st |= 8;
+    if (c.status_ & STATUS_SET_TURN) st |= 16;
+    if (c.status_ & STATUS_FLIP_SUMMON_TURN) st |= 32;
+    if (c.status_ & STATUS_ATTACK_CANCELED) st |= 64;
+    if (c.status_ & STATUS_FORM_CHANGED) st |= 128;
+    f(row, kCcStatus) = st;
+    f(row, kCcLScale) = static_cast<uint8_t>(std::min<uint32_t>(c.lscale_, 255));
+    f(row, kCcRScale) = static_cast<uint8_t>(std::min<uint32_t>(c.rscale_, 255));
+    f(row, kCcLiveAttribute) = attribute_to_id_safe(c.attribute_live_);
+    f(row, kCcLiveRace) = race_to_id_safe(c.race_live_);
+    auto live_type = type_to_ids(c.type_live_);
+    for (int j = 0; j < int(live_type.size()) && j < 32; ++j) {
+      if (live_type[j]) {
+        f(row, kCcLiveType0 + j / 8) |= static_cast<uint8_t>(1u << (j % 8));
+      }
+    }
   }
 
   // ygopro layout (D4): 23 features — 8 scalars, then the 14 per-location
@@ -2619,6 +2839,25 @@ private:
 
     for (int i = 0; i < loc_n_cards.size() && i < 14; i++) {
       feat(8 + i) = static_cast<uint8_t>(std::min(loc_n_cards[i], 255));
+    }
+    if (obs_version_ >= 2) {
+      feat(kGcNormalSummons) =
+          static_cast<uint8_t>(std::min(normal_summons_this_turn_, 255));
+      feat(kGcAttacks) = static_cast<uint8_t>(std::min(attacks_this_turn_, 255));
+      feat(kGcChainLen) = 0;  // stage 4
+      auto mit = msg2id.find(msg_);
+      feat(kGcMsg) = mit == msg2id.end() ? 0 : mit->second;
+      feat(kGcSelMin) = static_cast<uint8_t>(std::clamp(ms_min_, 0, 255));
+      feat(kGcSelMax) = static_cast<uint8_t>(std::clamp(ms_max_, 0, 255));
+      feat(kGcSelFlags) = static_cast<uint8_t>((ms_idx_ != -1 ? 1 : 0) |
+                                               (ms_mode_ ? 2 : 0));
+      // kGcNActions is written in WriteState after the option list is final
+      feat(kGcRuleSet) = kRuleSetId;
+      feat(kGcObsVersion) = 2;
+      for (int i = 0; i < 7; ++i) {
+        feat(kGcOverflow0 + i) = static_cast<uint8_t>(
+            std::min(row_overflow_[i] + row_overflow_[7 + i], 255));
+      }
     }
   }
 
@@ -2842,8 +3081,13 @@ private:
     OCG_QueryInfo info = {query_flag, playerid, location, sequence};
     uint32_t length;
     auto buf_ = static_cast<uint8_t*>(OCG_DuelQuery(pduel, &length, &info));
+    if (length > kQueryBufSize) {
+      throw std::runtime_error(fmt::format(
+          "[query] location query of {} bytes exceeds the {}-byte buffer",
+          length, kQueryBufSize));
+    }
     if (length > 0) {
-      memcpy(buf, buf_, length);      
+      memcpy(buf, buf_, length);
     }
     return length;
   }
@@ -2857,8 +3101,13 @@ private:
     OCG_QueryInfo info = {query_flag, playerid, location};
     uint32_t length;
     auto buf_ = static_cast<uint8_t*>(OCG_DuelQueryLocation(pduel, &length, &info));
+    if (length > kQueryBufSize) {
+      throw std::runtime_error(fmt::format(
+          "[query] location query of {} bytes exceeds the {}-byte buffer",
+          length, kQueryBufSize));
+    }
     if (length > 0) {
-      memcpy(buf, buf_, length);      
+      memcpy(buf, buf_, length);
     }
     return length;
   }
@@ -2940,8 +3189,21 @@ private:
 
     // we can't shuffle because idx must be stable in callback
     if (n_options > max_options()) {
-      // This CLIPS legal play (drops trailing options). Diagnostic keeps the
-      // rate measurable in run logs; the fix is raising max_options.
+      if (obs_version_ >= 2 && msg_ != MSG_ANNOUNCE_CARD) {
+        // obs v2: clipping a legal option is an error, never a diagnostic.
+        // Announce is the one message whose candidate set is a bitset
+        // (announce_mask_, stage 6) rather than a row list. Printed first:
+        // a throw inside a pool worker thread hangs the pool rather than
+        // aborting, so the log must name the cause.
+        fmt::print(stderr, "[optoverflow] msg={} options={} max_options={}\n",
+                   msg_to_string(msg_), n_options, max_options());
+        throw std::runtime_error(fmt::format(
+            "[optoverflow] msg={} options={} max_options={}: raise "
+            "max_options (obs v2 never clips a legal option)",
+            msg_to_string(msg_), n_options, max_options()));
+      }
+      // v1: this CLIPS legal play (drops trailing options). Diagnostic keeps
+      // the rate measurable in run logs; the fix is raising max_options.
       fmt::print(stderr, "[optclip] msg={} options={} max={}\n",
                  msg_to_string(msg_), n_options, max_options());
       options_.resize(max_options());
@@ -2965,6 +3227,15 @@ private:
     }
 
     _set_obs_actions(state["obs:actions_"_], legal_actions_);
+    if (obs_version_ >= 2) {
+      state["obs:global_"_][kGcNActions] =
+          static_cast<uint8_t>(std::min(n_options, 255));
+      for (int i = 0; i < n_options; ++i) {
+        const auto &a = legal_actions_[i];
+        state["obs:actions_"_](i, kAcPassCancel) = static_cast<uint8_t>(
+            (a.act_ == ActionAct::Cancel ? 1 : 0) | (a.finish_ ? 2 : 0));
+      }
+    }
 
     // write history actions (newest first), then convert the stored turn
     // number into a turn-diff relative to now
@@ -3345,8 +3616,34 @@ private:
     uint32_t counter = 0;
     uint32_t status = 0;
     std::vector<CardCode> overlay_codes;
+    // obs v2
+    uint32_t type = 0;
+    uint32_t attribute = 0;
+    uint64_t race = 0;
+    int32_t base_attack = 0;
+    int32_t base_defense = 0;
+    uint8_t owner = 255;
+    bool has_equip = false;
+    loc_info equip{};
+    std::vector<loc_info> targets;
+    uint8_t is_public = 0;
   };
 
+  uint64_t q_at_u64(int off) const {
+    uint64_t v;
+    memcpy(&v, query_buf_ + off, 8);
+    return v;
+  }
+  // loc_info as the core packs it in a query: u8 controler, u8 location,
+  // u32 sequence, u32 position (10 bytes).
+  loc_info q_at_loc_info(int off) const {
+    loc_info li;
+    li.controler = query_buf_[off];
+    li.location = query_buf_[off + 1];
+    memcpy(&li.sequence, query_buf_ + off + 2, 4);
+    memcpy(&li.position, query_buf_ + off + 6, 4);
+    return li;
+  }
   uint32_t q_at_u32(int off) const {
     uint32_t v;
     memcpy(&v, query_buf_ + off, 4);
@@ -3424,6 +3721,45 @@ private:
       case QUERY_STATUS:
         r.status = q_at_u32(payload);
         break;
+      // ---- obs v2 ----
+      case QUERY_TYPE:
+        r.type = q_at_u32(payload);
+        break;
+      case QUERY_ATTRIBUTE:
+        r.attribute = q_at_u32(payload);
+        break;
+      case QUERY_RACE:
+        r.race = q_at_u64(payload);
+        break;
+      case QUERY_BASE_ATTACK:
+        r.base_attack = static_cast<int32_t>(q_at_u32(payload));
+        break;
+      case QUERY_BASE_DEFENSE:
+        r.base_defense = static_cast<int32_t>(q_at_u32(payload));
+        break;
+      case QUERY_OWNER:
+        r.owner = query_buf_[payload];
+        break;
+      case QUERY_IS_PUBLIC:
+        r.is_public = query_buf_[payload];
+        break;
+      case QUERY_EQUIP_CARD: {
+        // 10 payload bytes either way: a loc_info, or u16 0 + u64 0 when
+        // there is no equip target — the location byte tells them apart.
+        loc_info li = q_at_loc_info(payload);
+        if (li.location != 0) {
+          r.has_equip = true;
+          r.equip = li;
+        }
+        break;
+      }
+      case QUERY_TARGET_CARD: {
+        uint32_t n = q_at_u32(payload);
+        for (uint32_t i = 0; i < n && payload + 4 + 10 * (i + 1) <= next; ++i) {
+          r.targets.push_back(q_at_loc_info(payload + 4 + 10 * i));
+        }
+        break;
+      }
       default:
         break;
       }
@@ -3463,6 +3799,16 @@ private:
     }
     c.counter_ = r.counter;
     c.status_ = r.status;
+    c.type_live_ = r.type;
+    c.attribute_live_ = r.attribute;
+    c.race_live_ = r.race;
+    c.base_attack_ = r.base_attack;
+    c.base_defense_ = r.base_defense;
+    c.owner_ = r.owner;
+    c.has_equip_target_ = r.has_equip;
+    c.equip_target_ = r.equip;
+    c.target_cards_ = r.targets;
+    c.is_public_ = r.is_public;
     return c;
   }
 
@@ -3503,6 +3849,12 @@ private:
                     QUERY_ATTACK | QUERY_DEFENSE | QUERY_EQUIP_CARD |
                     QUERY_OVERLAY_CARD | QUERY_COUNTERS | QUERY_STATUS |
                     QUERY_LSCALE | QUERY_RSCALE | QUERY_LINK;
+    if (obs_version_ >= 2) {
+      // live type / attribute / race, original stats, owner, effect targets
+      // (the core emits QUERY_IS_PUBLIC unconditionally)
+      flags |= QUERY_TYPE | QUERY_ATTRIBUTE | QUERY_RACE | QUERY_BASE_ATTACK |
+               QUERY_BASE_DEFENSE | QUERY_OWNER | QUERY_TARGET_CARD;
+    }
     int32_t bl = OCG_QueryFieldCard(pduel_, player, loc, flags, query_buf_, 0);
     if (std::getenv("YGOENV_QUERY_DEBUG")) {
       fmt::print(stderr, "[qdbg] player={} loc={} bl={} bytes:", player, loc, bl);
@@ -3785,6 +4137,8 @@ private:
     } else if (msg_ == MSG_NEW_TURN) {
       tp_ = int(read_u8());
       turn_count_++;
+      normal_summons_this_turn_ = 0;
+      attacks_this_turn_ = 0;
       revealed_.clear();
       revealed_owner_ = 255;
       revealed_hand_n_ = -1;
@@ -3954,13 +4308,16 @@ private:
         }
       }
     } else if (msg_ == MSG_SET) {
+      CardCode code = read_u32();
+      Card card = c_get_card(code);
+      card.set_location(read_loc_info());
+      if (card.location_ & LOCATION_MZONE) {
+        ++normal_summons_this_turn_;  // a monster Set spends the Normal Summon
+      }
       if (!verbose_) {
         dp_ = dl_;
         return;
       }
-      CardCode code = read_u32();
-      Card card = c_get_card(code);
-      card.set_location(read_loc_info());
       auto c = card.controler_;
       auto cpl = players_[c];
       auto opl = players_[1 - c];
@@ -4395,6 +4752,7 @@ private:
     } else if (msg_ == MSG_SUMMONED) {
       dp_ = dl_;
     } else if (msg_ == MSG_SUMMONING) {
+      ++normal_summons_this_turn_;
       if (!verbose_) {
         dp_ = dl_;
         return;
@@ -4530,6 +4888,7 @@ private:
           pl->nickname_ + " pays " + std::to_string(cost) + " LP. " +
           pl->nickname_ + "'s LP is now " + std::to_string(lp_[player]) + ".");
     } else if (msg_ == MSG_ATTACK) {
+      ++attacks_this_turn_;
       if (!verbose_) {
         dp_ = dl_;
         return;
