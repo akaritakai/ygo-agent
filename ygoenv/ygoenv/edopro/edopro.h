@@ -1129,6 +1129,15 @@ public:
   const uint32_t &level() const { return level_; }
   const std::vector<std::string> &strings() const { return strings_; }
 
+  loc_info get_info_location_v2() const {
+    loc_info li;
+    li.controler = controler_;
+    li.location = static_cast<uint8_t>(location_);
+    li.sequence = sequence_;
+    li.position = position_;
+    return li;
+  }
+
   std::string get_spec(bool opponent) const {
     return ls_to_spec(location_, sequence_, position_, opponent);
   }
@@ -1828,6 +1837,8 @@ constexpr int kCcRScale = 49;
 constexpr int kCcLiveAttribute = 50;
 constexpr int kCcLiveRace = 51;
 constexpr int kCcLiveType0 = 52;      // 4 bytes: the 25 type bits in type2str order
+// 56–63 reserved; the chain-link column rides in the last live-type byte's slot
+constexpr int kCcOnChainLink = 55;    // chain link number this card is activating; 0 none
 // global_ v2 columns (0–22 are v1)
 constexpr int kGcNormalSummons = 23;  // Normal Summons / Sets this turn
 constexpr int kGcAttacks = 24;        // attacks declared this turn
@@ -1840,6 +1851,17 @@ constexpr int kGcNActions = 30;
 constexpr int kGcRuleSet = 31;        // Master Rule era the duel was created under
 constexpr int kGcObsVersion = 32;
 constexpr int kGcOverflow0 = 33;      // 7 per-location counts of rows dropped by the row budget
+// chain_ v2 columns (one row per live chain link, newest last)
+constexpr int kChCardRow = 0;      // 1-based row of the activating card in cards_; 0 if gone
+constexpr int kChEffectIdx = 1;    // effect ordinal within that card (effect table)
+constexpr int kChPlayer = 2;       // 0 = me, 1 = opponent (relative to the acting seat)
+constexpr int kChEventClass = 3;   // stable event-class id, low byte
+constexpr int kChEventClassHi = 4;
+constexpr int kChNegated = 5;      // 1 negated, 2 effect disabled
+constexpr int kChTarget0 = 6;      // up to 3 target rows (1-based)
+constexpr int kChLinkIdx = 9;      // chain link number (1-based)
+constexpr int kChIsSpellTrap = 10; // the activating card is a Spell/Trap
+constexpr int kChNTargets = 11;    // total targets, including any beyond the 3 rows
 // actions_ v2 columns (0–11 are v1)
 constexpr int kAcPassCancel = 12;     // cancel 1, finish 2
 constexpr uint8_t kRuleSetId = 5;     // duel_options_ is DUEL_MODE_MR5 (a constant today)
@@ -1858,11 +1880,19 @@ constexpr uint8_t kCountCodeDuel = 0x2;  // EFFECT_COUNT_CODE_DUEL: once per due
 inline uint64_t hopt_key(uint32_t cl_code, uint8_t cl_idx) {
   return (uint64_t(cl_code) << 8) | cl_idx;
 }
+// What the env needs to know about one activation: which effect of the card it
+// is (ordinal), what event class it belongs to, and which count-limit groups it
+// spends. Ordinals/classes come from the same generated table (v2).
+struct ChainInfo {
+  uint8_t idx = 0;       // effect ordinal within the card
+  uint16_t ev_idx = 0;   // stable event-class id (table-assigned)
+  std::vector<EffectGroup> groups;
+};
 struct EffectTable {
   bool loaded = false;
   std::string path;
-  // (canonical, desc) -> groups spent by an activation (usually one)
-  ankerl::unordered_dense::map<uint64_t, std::vector<EffectGroup>> chain;
+  // (canonical, desc) -> the effect an activation of that description is
+  ankerl::unordered_dense::map<uint64_t, ChainInfo> chain;
   // canonical -> groups spent by its own summon procedure(s)
   ankerl::unordered_dense::map<uint32_t, std::vector<EffectGroup>> spsummon;
   ankerl::unordered_dense::map<uint32_t, std::vector<EffectGroup>> summon;
@@ -1915,32 +1945,42 @@ inline void load_effect_table(const std::string &path) {
       }
       uint32_t canonical = std::stoul(cols[0]);
       uint64_t desc = std::stoull(cols[1]);
-      const std::string &event = cols[3];
+      uint8_t idx = static_cast<uint8_t>(std::stoul(cols[2]));
+      const std::string &kind = cols[3];
       EffectGroup g{static_cast<uint32_t>(std::stoul(cols[4])),
                     static_cast<uint8_t>(std::stoul(cols[5])),
                     static_cast<uint8_t>(std::stoul(cols[6]))};
+      uint16_t ev_idx = static_cast<uint16_t>(std::stoul(cols[8]));
+      const bool has_group = g.cl_code != 0;
       auto add_unique = [](std::vector<EffectGroup> &v, const EffectGroup &g) {
         for (const auto &x : v) {
           if (x.cl_code == g.cl_code && x.cl_idx == g.cl_idx) return;
         }
         v.push_back(g);
       };
-      if (event == "chain") {
-        add_unique(effect_table_.chain[EffectTable::chain_key(canonical, desc)], g);
-      } else if (event == "spsummon") {
+      if (kind == "chain") {
+        auto &ci = effect_table_.chain[EffectTable::chain_key(canonical, desc)];
+        if (ci.idx == 0) {          // first row wins; ambiguity is counted by the generator
+          ci.idx = idx;
+          ci.ev_idx = ev_idx;
+        }
+        if (has_group) add_unique(ci.groups, g);
+      } else if (kind == "spsummon" && has_group) {
         add_unique(effect_table_.spsummon[canonical], g);
-      } else if (event == "summon") {
+      } else if (kind == "summon" && has_group) {
         add_unique(effect_table_.summon[canonical], g);
       }
-      auto &gs = effect_table_.groups[canonical];
-      if (gs.size() < 4) {
-        add_unique(gs, g);
+      if (has_group) {
+        auto &gs = effect_table_.groups[canonical];
+        if (gs.size() < 4) {
+          add_unique(gs, g);
+        }
       }
       ++rows;
     }
     effect_table_.loaded = rows > 0;
     effect_table_once_flag_set_ = true;
-    fmt::print(stderr, "[effect_table] {} rows, {} chain keys, {} spsummon procs, {} cards with groups\n",
+    fmt::print(stderr, "[effect_table] {} rows, {} chain keys, {} spsummon procs, {} cards with count-limit groups\n",
                rows, effect_table_.chain.size(), effect_table_.spsummon.size(),
                effect_table_.groups.size());
   });
@@ -2215,6 +2255,21 @@ protected:
   std::array<ankerl::unordered_dense::set<uint64_t>, 2> hopt_used_;
   std::array<ankerl::unordered_dense::set<uint64_t>, 2> hopt_used_duel_;
   std::array<ankerl::unordered_dense::map<uint32_t, uint8_t>, 2> activations_;
+  // live chain stack, shadowed from MSG_CHAINING/CHAIN_SOLVED/CHAIN_END
+  struct ChainLink {
+    CardCode code = 0;
+    uint8_t chain_count = 0;
+    uint8_t controler = 0;      // absolute player id of the activating card
+    uint8_t triggering_player = 0;
+    loc_info handler{};
+    uint64_t desc = 0;
+    uint8_t negated = 0;
+    bool spell_trap = false;
+    std::vector<loc_info> targets;
+  };
+  std::vector<ChainLink> chain_stack_;
+  // (controler, location, sequence) -> 1-based cards_ row, rebuilt every WriteState
+  ankerl::unordered_dense::map<uint32_t, int> row_of_;
   // branch counters (printed at episode end when non-zero under verbose)
   int reg_marks_ = 0;            // activations mapped to a group
   int reg_unmapped_ = 0;         // activations with no table entry
@@ -2362,6 +2417,8 @@ public:
       activations_[p].clear();
     }
     reg_marks_ = reg_unmapped_ = reg_ambiguous_ = reg_proc_marks_ = 0;
+    chain_stack_.clear();
+    row_of_.clear();
 
     history_actions_0_.Zero();
     history_actions_1_.Zero();
@@ -2535,24 +2592,26 @@ public:
     }
   }
   // An activation: MSG_CHAINING (card code, triggering player, description).
-  void register_activation(CardCode code, PlayerId player, uint64_t desc) {
+  const ChainInfo *register_activation(CardCode code, PlayerId player,
+                                       uint64_t desc) {
     if (obs_version_ < 2 || player > 1) {
-      return;
+      return nullptr;
     }
     uint32_t canonical = canonical_code(code);
     auto &cnt = activations_[player][canonical];
     if (cnt < 255) ++cnt;
     if (!effect_table_.loaded) {
-      return;
+      return nullptr;
     }
     auto it = effect_table_.chain.find(EffectTable::chain_key(canonical, desc));
     if (it == effect_table_.chain.end()) {
       ++reg_unmapped_;
-      return;
+      return nullptr;
     }
-    if (it->second.size() > 1) ++reg_ambiguous_;
-    ++reg_marks_;
-    mark_groups(player, it->second);
+    if (it->second.groups.size() > 1) ++reg_ambiguous_;
+    if (!it->second.groups.empty()) ++reg_marks_;
+    mark_groups(player, it->second.groups);
+    return &it->second;
   }
   // A summon by the card's own procedure (inherent): MSG_SPSUMMONING whose
   // reason lacks REASON_EFFECT, or MSG_SUMMONING for summon procedures.
@@ -2606,6 +2665,54 @@ public:
         }
       }
       f(row, kCcHoptUsed) = bits;
+    }
+  }
+
+  int row_for(const loc_info &li) const {
+    auto it = row_of_.find(obs_row_key(li.controler, li.location, li.sequence));
+    return it == row_of_.end() ? 0 : it->second;
+  }
+  // chain_ + the chain half of the knowledge column. Runs after _set_obs_cards
+  // (it needs row_of_) and writes back into cards_ so "on the chain" and
+  // "targeted by the chain" are card features as well as chain rows.
+  void _set_obs_chain(TArray<uint8_t> &f_chain, TArray<uint8_t> &f_cards,
+                      PlayerId to_play) {
+    int n = static_cast<int>(chain_stack_.size());
+    int first = std::max(0, n - kChainRowsV2);   // keep the newest links
+    for (int i = first; i < n; ++i) {
+      const auto &link = chain_stack_[i];
+      const int row = i - first;
+      int card_row = row_for(link.handler);
+      f_chain(row, kChCardRow) = static_cast<uint8_t>(std::min(card_row, 255));
+      const ChainInfo *info = nullptr;
+      if (effect_table_.loaded) {
+        auto it = effect_table_.chain.find(
+            EffectTable::chain_key(canonical_code(link.code), link.desc));
+        if (it != effect_table_.chain.end()) info = &it->second;
+      }
+      f_chain(row, kChEffectIdx) = info ? info->idx : 0;
+      f_chain(row, kChPlayer) = link.triggering_player == to_play ? 0 : 1;
+      uint16_t ev = info ? info->ev_idx : 0;
+      f_chain(row, kChEventClass) = static_cast<uint8_t>(ev & 0xff);
+      f_chain(row, kChEventClassHi) = static_cast<uint8_t>(ev >> 8);
+      f_chain(row, kChNegated) = link.negated;
+      f_chain(row, kChLinkIdx) = link.chain_count;
+      f_chain(row, kChIsSpellTrap) = link.spell_trap ? 1 : 0;
+      f_chain(row, kChNTargets) =
+          static_cast<uint8_t>(std::min<size_t>(link.targets.size(), 255));
+      for (size_t t = 0; t < link.targets.size() && t < 3; ++t) {
+        int trow = row_for(link.targets[t]);
+        f_chain(row, kChTarget0 + static_cast<int>(t)) =
+            static_cast<uint8_t>(std::min(trow, 255));
+        if (trow > 0) {
+          f_cards(trow - 1, kCcKnowledge) |= 32;   // targeted by the live chain
+        }
+      }
+      if (card_row > 0) {
+        f_cards(card_row - 1, kCcKnowledge) |= 16;  // on the chain
+        f_cards(card_row - 1, kCcOnChainLink) =
+            static_cast<uint8_t>(link.chain_count);
+      }
     }
   }
 
@@ -2871,6 +2978,7 @@ private:
       }
     }
     if (obs_version_ >= 2) {
+      row_of_ = row_of;
       for (const auto &p : pending) {
         auto it = row_of.find(obs_row_key(p.target.controler, p.target.location,
                                           p.target.sequence));
@@ -3398,6 +3506,11 @@ private:
         _set_obs_cards(state["obs:cards_"_], to_play_);
 
     _set_obs_global(state["obs:global_"_], to_play_, loc_n_cards);
+    if (obs_version_ >= 2) {
+      _set_obs_chain(state["obs:chain_"_], state["obs:cards_"_], to_play_);
+      state["obs:global_"_][kGcChainLen] =
+          static_cast<uint8_t>(std::min<size_t>(chain_stack_.size(), 255));
+    }
 
     // we can't shuffle because idx must be stable in callback
     if (n_options > max_options()) {
@@ -4659,14 +4772,28 @@ private:
                  ") changed from " + prevpos_str + " to " + pos_str + ".");
     } else if (msg_ == MSG_BECOME_TARGET || msg_ == MSG_CARD_SELECTED) {
       if (!verbose_) {
+        if (obs_version_ >= 2 && msg_ == MSG_BECOME_TARGET &&
+            !chain_stack_.empty()) {
+          auto count = compat_read<uint8_t, uint32_t>();
+          for (uint32_t i = 0; i < count; ++i) {
+            chain_stack_.back().targets.push_back(read_loc_info());
+          }
+        }
         dp_ = dl_;
         return;
       }
       auto count = compat_read<uint8_t, uint32_t>();
       std::vector<Card> cards;
       cards.reserve(count);
+      if (obs_version_ >= 2 && msg_ == MSG_BECOME_TARGET) {
+        chain_stack_.empty() ? void() : chain_stack_.back().targets.clear();
+      }
       for (int i = 0; i < count; ++i) {
         auto info = read_loc_info();
+        if (obs_version_ >= 2 && msg_ == MSG_BECOME_TARGET &&
+            !chain_stack_.empty()) {
+          chain_stack_.back().targets.push_back(info);
+        }
         auto c = info.controler;
         auto loc = info.location;
         auto seq = info.sequence;
@@ -5042,11 +5169,25 @@ private:
                      atk + "/" + def + ") in " + pos + " position.");
         }
       }
-    } else if (msg_ == MSG_CHAIN_NEGATED) {
-      dp_ = dl_;
-    } else if (msg_ == MSG_CHAIN_DISABLED) {
+    } else if (msg_ == MSG_CHAIN_NEGATED || msg_ == MSG_CHAIN_DISABLED) {
+      // payload: u8 chain_count (core: operations.cpp / processor.cpp)
+      if (obs_version_ >= 2 && dp_ < dl_) {
+        uint8_t cc = data_[dp_];
+        for (auto &link : chain_stack_) {
+          if (link.chain_count == cc) {
+            link.negated |= (msg_ == MSG_CHAIN_NEGATED) ? 1 : 2;
+          }
+        }
+      }
       dp_ = dl_;
     } else if (msg_ == MSG_CHAIN_SOLVED) {
+      if (obs_version_ >= 2 && dp_ < dl_) {
+        uint8_t cc = data_[dp_];
+        chain_stack_.erase(
+            std::remove_if(chain_stack_.begin(), chain_stack_.end(),
+                           [cc](const ChainLink &l) { return l.chain_count == cc; }),
+            chain_stack_.end());
+      }
       dp_ = dl_;
       // NOT cleared here any more. Clearing at chain resolution threw away
       // hand knowledge the instant it was obtained, so a policy that looked at
@@ -5059,6 +5200,7 @@ private:
     } else if (msg_ == MSG_CHAINED) {
       dp_ = dl_;
     } else if (msg_ == MSG_CHAIN_END) {
+      chain_stack_.clear();
       dp_ = dl_;
     } else if (msg_ == MSG_CHAINING) {
       // Loop detection (Tournament Policy v2.5 "Infinite Loop"): an
@@ -5075,8 +5217,20 @@ private:
       auto cs = compat_read<uint8_t, uint32_t>();
       ++chains_since_decision_;
       loop_cause_code_ = code;
+      chaining_player_ = card.controler_;
       // obs v2 registers: the triggering player spends the effect's group
       register_activation(code, tc, desc);
+      if (obs_version_ >= 2) {
+        ChainLink link;
+        link.code = code;
+        link.chain_count = static_cast<uint8_t>(std::min<uint32_t>(cs, 255));
+        link.controler = card.controler_;
+        link.triggering_player = tc;
+        link.handler = card.get_info_location_v2();
+        link.desc = desc;
+        link.spell_trap = (card.type_ & (TYPE_SPELL | TYPE_TRAP)) != 0;
+        chain_stack_.push_back(link);
+      }
       if (!verbose_) {
         dp_ = dl_;
         return;
